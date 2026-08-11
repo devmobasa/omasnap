@@ -194,6 +194,7 @@ Install the corresponding Tesseract language data before adding a language to
 | Wheel | Scale selected layer or change active tool size |
 | Double-click text | Reopen text editing |
 | `Delete` | Delete selected layer |
+| `E` | Clear all annotations |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Shift+Z`, `Ctrl+Y` | Redo |
 | `Ctrl+C` | Copy PNG only |

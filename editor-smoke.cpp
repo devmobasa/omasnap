@@ -287,7 +287,7 @@ int main(int argc, char **argv) {
     return 14;
   QTest::mouseClick(&editor, Qt::LeftButton, Qt::NoModifier, QPoint(460, 134));
   QTest::mouseClick(&editor, Qt::LeftButton, Qt::NoModifier, QPoint(320, 200));
-  QTest::mouseMove(&editor, QPoint(178, 92), 20);
+  QTest::mouseMove(&editor, QPoint(158, 92), 20);
   application.processEvents();
   if (editor.cursor().shape() != Qt::PointingHandCursor)
     return 12;
@@ -369,6 +369,74 @@ int main(int argc, char **argv) {
       !windowSurfaceUi.save(
           outputRoot + QStringLiteral("-window-surface-editor.png"), "PNG"))
     return 62;
+
+  CaptureEditor clearEditor(capture, CaptureEditor::CaptureMode::Fullscreen);
+  clearEditor.resize(800, 600);
+  clearEditor.show();
+  application.processEvents();
+  const QImage emptyClearSnapshot(snapshotPath);
+  QTest::keyClick(&clearEditor, Qt::Key_A);
+  QTest::mousePress(&clearEditor, Qt::LeftButton, Qt::NoModifier,
+                    QPoint(220, 250));
+  QTest::mouseMove(&clearEditor, QPoint(480, 300), 20);
+  QTest::mouseRelease(&clearEditor, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(480, 300));
+  const QImage beforeClearSnapshot(snapshotPath);
+  if (emptyClearSnapshot.isNull() || beforeClearSnapshot == emptyClearSnapshot)
+    return 65;
+
+  QTest::keyClick(&clearEditor, Qt::Key_E);
+  QTest::keyClick(&clearEditor, Qt::Key_E);
+  QTest::mouseClick(&clearEditor, Qt::LeftButton, Qt::NoModifier,
+                    QPoint(558, 40));
+  if (QImage(snapshotPath) != emptyClearSnapshot)
+    return 66;
+  QTest::keyClick(&clearEditor, Qt::Key_Z, Qt::ControlModifier);
+  if (QImage(snapshotPath) != beforeClearSnapshot)
+    return 67;
+
+  QTest::keyClick(&clearEditor, Qt::Key_Backspace, Qt::ControlModifier);
+  QTest::keyClick(&clearEditor, Qt::Key_E, Qt::ControlModifier);
+  QTest::keyClick(&clearEditor, Qt::Key_E, Qt::ShiftModifier);
+  if (QImage(snapshotPath) != beforeClearSnapshot)
+    return 68;
+
+  QTest::mouseClick(&clearEditor, Qt::LeftButton, Qt::NoModifier,
+                    QPoint(350, 275));
+  QTest::keyClick(&clearEditor, Qt::Key_Backspace, Qt::ControlModifier);
+  if (QImage(snapshotPath) != emptyClearSnapshot)
+    return 69;
+  QTest::keyClick(&clearEditor, Qt::Key_Z, Qt::ControlModifier);
+  if (QImage(snapshotPath) != beforeClearSnapshot)
+    return 70;
+
+  QTest::mouseClick(&clearEditor, Qt::LeftButton, Qt::NoModifier,
+                    QPoint(558, 40));
+  if (QImage(snapshotPath) != emptyClearSnapshot)
+    return 71;
+  QTest::keyClick(&clearEditor, Qt::Key_Z, Qt::ControlModifier);
+  if (QImage(snapshotPath) != beforeClearSnapshot)
+    return 72;
+  clearEditor.close();
+
+  CaptureEditor draftClearEditor(capture,
+                                 CaptureEditor::CaptureMode::Fullscreen);
+  draftClearEditor.resize(800, 600);
+  draftClearEditor.show();
+  application.processEvents();
+  QTest::keyClick(&draftClearEditor, Qt::Key_T);
+  QTest::mouseClick(&draftClearEditor, Qt::LeftButton, Qt::NoModifier,
+                    QPoint(350, 300));
+  auto *draftTextEditor = draftClearEditor.findChild<QLineEdit *>();
+  if (draftTextEditor == nullptr || !draftTextEditor->isVisible())
+    return 73;
+  QTest::keyClicks(draftTextEditor, QStringLiteral("Draft annotation"));
+  QTest::mouseClick(&draftClearEditor, Qt::LeftButton, Qt::NoModifier,
+                    QPoint(558, 40));
+  if (!draftTextEditor->isVisible() ||
+      draftTextEditor->text() != QStringLiteral("Draft annotation"))
+    return 74;
+  draftClearEditor.close();
 
   CaptureEditor cropEditor(capture);
   cropEditor.resize(800, 600);

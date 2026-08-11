@@ -29,7 +29,7 @@ constexpr std::array<const char *, 6> kColorNames{
     "#ff375f", "#ff9f0a", "#ffd60a", "#30d158", "#0a84ff", "#bf5af2"};
 constexpr std::array<qreal, 3> kTextSizes{2.0, 5.0, 9.0};
 constexpr std::array<const char *, 3> kTextSizeNames{"S", "M", "L"};
-constexpr qreal kToolbarWidth = 640;
+constexpr qreal kToolbarWidth = 680;
 
 bool hasEndpointHandles(Annotation::Kind kind) {
   return kind == Annotation::Kind::Arrow || kind == Annotation::Kind::Line ||
@@ -192,6 +192,12 @@ void drawToolbarIcon(QPainter &painter, const QRectF &bounds,
     path.cubicTo(16, 8, 10, 7, 6, 10);
     path.cubicTo(4, 12, 4, 15, 5, 17);
     painter.drawPath(path);
+  } else if (action == QStringLiteral("clear")) {
+    painter.drawRoundedRect(QRectF(6, 7, 12, 14), 2, 2);
+    painter.drawLine(QPointF(4, 7), QPointF(20, 7));
+    painter.drawLine(QPointF(9, 4), QPointF(15, 4));
+    painter.drawLine(QPointF(10, 11), QPointF(10, 17));
+    painter.drawLine(QPointF(14, 11), QPointF(14, 17));
   } else if (action == QStringLiteral("copy") ||
              action == QStringLiteral("both")) {
     painter.drawRoundedRect(QRectF(8, 8, 12, 12), 2, 2);
@@ -734,6 +740,7 @@ QVector<CaptureEditor::ToolbarButton> CaptureEditor::toolbarButtons() const {
   add(36, QStringLiteral("undo"), {}, QStringLiteral("Undo · Ctrl+Z"));
   add(36, QStringLiteral("redo"), {},
       QStringLiteral("Redo · Ctrl+Shift+Z / Ctrl+Y"));
+  add(36, QStringLiteral("clear"), {}, QStringLiteral("Clear annotations · E"));
   add(36, QStringLiteral("copy"), {}, QStringLiteral("Copy only · Ctrl+C"));
   add(40, QStringLiteral("both"), {}, QStringLiteral("Copy and save · Enter"));
   add(36, QStringLiteral("save"), {}, QStringLiteral("Save only · Ctrl+S"));
@@ -805,6 +812,24 @@ void CaptureEditor::pushUndoState(const EditState &state) {
 }
 
 void CaptureEditor::recordEdit() { pushUndoState(editState()); }
+
+void CaptureEditor::clearAnnotations() {
+  // Keep an uncommitted text draft intact when there is nothing to clear.
+  if (annotations_.isEmpty()) {
+    setStatus(QStringLiteral("Nothing to clear"));
+    return;
+  }
+  cancelActiveDragForHistory();
+  textEditor_->clear();
+  textEditor_->hide();
+  editingAnnotation_ = -1;
+  recordEdit();
+  annotations_.clear();
+  selectedAnnotation_ = -1;
+  nextMarker_ = 1;
+  persistSnapshot();
+  setStatus(QStringLiteral("Annotations cleared · Ctrl+Z to undo"));
+}
 
 void CaptureEditor::undoEdit() {
   cancelActiveDragForHistory();
@@ -1112,6 +1137,8 @@ void CaptureEditor::handleToolbar(const QString &action) {
     undoEdit();
   } else if (action == QStringLiteral("redo")) {
     redoEdit();
+  } else if (action == QStringLiteral("clear")) {
+    clearAnnotations();
   } else if (action == QStringLiteral("copy"))
     finish(OutputMode::Copy);
   else if (action == QStringLiteral("both"))
@@ -1188,6 +1215,9 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
   } else if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
     finish(OutputMode::Both);
     return;
+  } else if (event->key() == Qt::Key_E &&
+             event->modifiers() == Qt::NoModifier) {
+    clearAnnotations();
   } else if ((event->key() == Qt::Key_Delete ||
               event->key() == Qt::Key_Backspace) &&
              selectedAnnotation_ >= 0 &&

@@ -106,6 +106,7 @@ private:
   void cancelActiveDragForHistory();
   void beginText(const QPointF &point, int annotationIndex = -1);
   void chooseWindow(int index);
+  void clearAnnotations();
   [[nodiscard]] EditState editState() const;
   void enterEdit(QString status);
   void persistSnapshot();
