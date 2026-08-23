@@ -405,6 +405,11 @@ QPointF constrainedRedactionEndpoint(const QPointF &candidate,
 
 /// One top-to-bottom pass of the OCR scan band.
 constexpr qint64 kOcrSweepMs = 1200;
+/// How long the recognized-text card stays up, and how long its closing
+/// fade runs. The animation ticker only runs during the sweep and the fade;
+/// the static card in between needs no repaints.
+constexpr int kOcrResultMs = 6000;
+constexpr int kOcrFadeMs = 450;
 
 void drawInstantTooltip(QPainter &painter, const QRect &bounds,
                         const QRectF &anchor, const QString &text) {
@@ -616,10 +621,27 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
 
   ocrAnimTimer_.setInterval(16);
   connect(&ocrAnimTimer_, &QTimer::timeout, this, [this] { update(); });
+  // Both deadlines are precise: the coarse default can fire 5% early
+  // (about 280 ms on the fade delay), which would tick a still-static card.
+  // The smoke suite shortens the card lifetime through the environment so it
+  // can walk the whole static-then-fade lifecycle without a six-second wait.
+  int ocrResultMs =
+      qEnvironmentVariableIntValue("OMASNAP_TEST_OCR_RESULT_MS");
+  if (ocrResultMs <= kOcrFadeMs + 34)
+    ocrResultMs = kOcrResultMs;
   ocrResultTimer_.setSingleShot(true);
-  ocrResultTimer_.setInterval(6000);
+  ocrResultTimer_.setTimerType(Qt::PreciseTimer);
+  ocrResultTimer_.setInterval(ocrResultMs);
   connect(&ocrResultTimer_, &QTimer::timeout, this,
           [this] { dismissOcrOverlay(); });
+  // Wake one frame before the fade begins so its first tick lands on time.
+  ocrFadeTimer_.setSingleShot(true);
+  ocrFadeTimer_.setTimerType(Qt::PreciseTimer);
+  ocrFadeTimer_.setInterval(ocrResultMs - kOcrFadeMs - 17);
+  connect(&ocrFadeTimer_, &QTimer::timeout, this, [this] {
+    if (!ocrResultText_.isEmpty())
+      ocrAnimTimer_.start();
+  });
   connect(&ocrWatcher_, &QFutureWatcher<OcrResult>::finished, this, [this] {
     const OcrResult result = ocrWatcher_.result();
     busy_ = false;
@@ -652,10 +674,13 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
     QTimer::singleShot(wait, this, [this, shown] {
       if (ocrRegion_.isEmpty() || ocrWatcher_.isRunning())
         return; // dismissed, or a newer OCR took over the region
-      // The animation clock keeps ticking so the result card can fade out.
       ocrResultText_ = shown;
       ocrClock_.restart();
       ocrResultTimer_.start();
+      // The card is static until its closing fade: stop the per-frame
+      // ticker and let ocrFadeTimer_ re-arm it for the last kOcrFadeMs.
+      ocrAnimTimer_.stop();
+      ocrFadeTimer_.start();
       update();
     });
   });
@@ -2700,6 +2725,7 @@ void CaptureEditor::runOcr(const QRectF &localSelection) {
   ocrRegion_ = target.translated(-selection_.topLeft());
   ocrResultText_.clear();
   ocrResultTimer_.stop();
+  ocrFadeTimer_.stop();
   ocrClock_.start();
   ocrAnimTimer_.start();
   setStatus(QStringLiteral("Reading selected text…"));
@@ -2736,6 +2762,7 @@ void CaptureEditor::runOcr(const QRectF &localSelection) {
 void CaptureEditor::dismissOcrOverlay() {
   ocrAnimTimer_.stop();
   ocrResultTimer_.stop();
+  ocrFadeTimer_.stop();
   ocrRegion_ = QRectF();
   ocrResultText_.clear();
   update();
@@ -2775,10 +2802,10 @@ void CaptureEditor::paintOcrOverlay(QPainter &painter, const QRectF &image,
 
   // Result: the recognized text on a card anchored to the region, fading out
   // over the last part of its display time.
-  constexpr int kFadeMs = 450;
   const int remaining = ocrResultTimer_.remainingTime();
   const qreal opacity =
-      remaining < 0 ? 1.0 : std::clamp(remaining / qreal(kFadeMs), 0.0, 1.0);
+      remaining < 0 ? 1.0
+                    : std::clamp(remaining / qreal(kOcrFadeMs), 0.0, 1.0);
   painter.setOpacity(opacity);
 
   QFont font(QStringLiteral("Noto Sans"));

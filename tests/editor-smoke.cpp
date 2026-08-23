@@ -2793,6 +2793,146 @@ bool runOpLogCapKeepsLeadingCrop(QApplication &application, QString &error) {
   return true;
 }
 
+/**
+ * The OCR overlay animates only while something on screen moves: the
+ * per-frame ticker runs during the scan sweep, stops while the
+ * recognized-text card sits static, and a fade timer re-arms it for the
+ * closing fade. A static card repainted at animation rate was hundreds of
+ * wasted full-surface repaints per OCR.
+ */
+bool runOcrTickerIdleWhileCardStatic(QApplication &application,
+                                     QString &error) {
+  // The card only appears after the recognized text lands on the clipboard,
+  // and CI has no compositor: stand in for wl-copy/wl-paste with a pair of
+  // fakes that store and replay the payload byte for byte.
+  QTemporaryDir helperDir;
+  if (!helperDir.isValid()) {
+    error = QStringLiteral("Could not create OCR helper directory");
+    return false;
+  }
+  const QString clipFile = QDir(helperDir.path()).filePath(
+      QStringLiteral("clip.bin"));
+  const auto writeHelper = [&](const QString &name, const QString &body) {
+    const QString path = QDir(helperDir.path()).filePath(name);
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly))
+      return false;
+    file.write(QStringLiteral("#!/bin/sh\n%1\n").arg(body).toUtf8());
+    file.close();
+    return QFile::setPermissions(path, QFileDevice::ReadOwner |
+                                           QFileDevice::WriteOwner |
+                                           QFileDevice::ExeOwner);
+  };
+  if (!writeHelper(QStringLiteral("wl-copy"),
+                   QStringLiteral("cat > '%1'").arg(clipFile)) ||
+      !writeHelper(QStringLiteral("wl-paste"),
+                   QStringLiteral("cat '%1'").arg(clipFile))) {
+    error = QStringLiteral("Could not write OCR clipboard fakes");
+    return false;
+  }
+  const QByteArray savedPath = qgetenv("PATH");
+  qputenv("PATH",
+          QFile::encodeName(helperDir.path()) + ":" + savedPath);
+  // A 900 ms card walks the whole static-then-fade lifecycle in test time:
+  // static for 433 ms, fading for the last 450 ms.
+  const QByteArray savedOcrMs = qgetenv("OMASNAP_TEST_OCR_RESULT_MS");
+  qputenv("OMASNAP_TEST_OCR_RESULT_MS", "900");
+  const auto restoreEnvironment = qScopeGuard([&savedPath, &savedOcrMs] {
+    qputenv("PATH", savedPath);
+    if (savedOcrMs.isEmpty())
+      qunsetenv("OMASNAP_TEST_OCR_RESULT_MS");
+    else
+      qputenv("OMASNAP_TEST_OCR_RESULT_MS", savedOcrMs);
+  });
+
+  CaptureData capture;
+  capture.monitor.name = QStringLiteral("TEST");
+  capture.monitor.geometry = {0, 0, 400, 300};
+  capture.monitor.pixelSize = {400, 300};
+  capture.monitor.scale = 1.0;
+  capture.source = QImage(400, 300, QImage::Format_ARGB32_Premultiplied);
+  capture.source.fill(Qt::white);
+  {
+    QPainter painter(&capture.source);
+    QFont font;
+    font.setPixelSize(48);
+    painter.setFont(font);
+    painter.setPen(Qt::black);
+    painter.drawText(capture.source.rect(), Qt::AlignCenter,
+                     QStringLiteral("OCR ticker 7"));
+  }
+  capture.previewSize = capture.source.size();
+
+  CaptureEditor editor(capture, CaptureEditor::CaptureMode::File);
+  editor.setSuppressSnapshots(true);
+  editor.resize(800, 600);
+  editor.show();
+  application.processEvents();
+
+  QTest::keyClick(&editor, Qt::Key_O);
+  application.processEvents();
+  if (!editor.ocrAnimatingForTest() || editor.ocrResultShownForTest()) {
+    error = QStringLiteral("OCR sweep did not start its animation ticker");
+    return false;
+  }
+
+  // Recognition plus the sweep-boundary wait lands well inside this window.
+  QElapsedTimer deadline;
+  deadline.start();
+  while (!editor.ocrResultShownForTest() && deadline.elapsed() < 15000)
+    QTest::qWait(10);
+  if (!editor.ocrResultShownForTest()) {
+    error = QStringLiteral("OCR result card never appeared: %1")
+                .arg(editor.statusForTest());
+    return false;
+  }
+
+  if (editor.ocrAnimatingForTest()) {
+    error = QStringLiteral(
+        "Animation ticker still ran while the OCR card was static");
+    return false;
+  }
+  if (!editor.ocrFadeScheduledForTest()) {
+    error = QStringLiteral("OCR card fade was not scheduled");
+    return false;
+  }
+
+  // Mid-static: 150 ms is several would-be ticks into the 433 ms static
+  // window, off any period boundary, and the ticker must still be idle.
+  QTest::qWait(150);
+  if (editor.ocrAnimatingForTest() || !editor.ocrResultShownForTest()) {
+    error = QStringLiteral("Ticker woke up during the static card period");
+    return false;
+  }
+
+  // The fade must actually fire: the ticker restarts while the card is
+  // still up. A broken timeout connection or a wrong interval stalls here.
+  deadline.restart();
+  while (!editor.ocrAnimatingForTest() && editor.ocrResultShownForTest() &&
+         deadline.elapsed() < 3000)
+    QTest::qWait(10);
+  if (!editor.ocrAnimatingForTest() || !editor.ocrResultShownForTest()) {
+    error = QStringLiteral("OCR card fade never restarted the ticker");
+    return false;
+  }
+  if (editor.ocrFadeScheduledForTest()) {
+    error = QStringLiteral("OCR fade timer stayed armed after it fired");
+    return false;
+  }
+
+  // The card then puts itself away and leaves no timer armed.
+  deadline.restart();
+  while (editor.ocrResultShownForTest() && deadline.elapsed() < 3000)
+    QTest::qWait(10);
+  if (editor.ocrResultShownForTest() || editor.ocrAnimatingForTest() ||
+      editor.ocrFadeScheduledForTest()) {
+    error = QStringLiteral("OCR card did not dismiss itself cleanly");
+    return false;
+  }
+  editor.close();
+  return true;
+}
+
 } // namespace
 /** Runs the interaction and rendering smoke checks. */
 /** Runs the interaction and rendering smoke checks. */
@@ -5863,6 +6003,10 @@ int main(int argc, char **argv) {
   if (!runOpLogCapKeepsLeadingCrop(application, snapshotError)) {
     qWarning().noquote() << snapshotError;
     return 84;
+  }
+  if (!runOcrTickerIdleWhileCardStatic(application, snapshotError)) {
+    qWarning().noquote() << snapshotError;
+    return 33;
   }
   const QString outputRoot =
       argc > 1 ? QString::fromLocal8Bit(argv[1])

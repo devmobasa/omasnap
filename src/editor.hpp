@@ -281,6 +281,19 @@ public:
     return {};
   }
   [[nodiscard]] bool textSizeMenuOpenForTest() const { return textSizeMenuOpen_; }
+  /// OCR overlay state, for the smoke suite: whether the recognized-text
+  /// card is up, whether the animation ticker is running, and whether the
+  /// fade re-arm is scheduled. The ticker must be idle while the card is
+  /// static; repainting a still card at animation rate is pure waste.
+  [[nodiscard]] bool ocrResultShownForTest() const {
+    return !ocrResultText_.isEmpty();
+  }
+  [[nodiscard]] bool ocrAnimatingForTest() const {
+    return ocrAnimTimer_.isActive();
+  }
+  [[nodiscard]] bool ocrFadeScheduledForTest() const {
+    return ocrFadeTimer_.isActive();
+  }
 
 private:
   /// What the armed tool is currently set to, for the status line: shown on
@@ -638,6 +651,10 @@ private:
   QElapsedTimer ocrClock_;
   QTimer ocrAnimTimer_;
   QTimer ocrResultTimer_;
+  /// Re-arms the animation ticker for the card's closing fade. While the
+  /// card is static the ticker is stopped: nothing on screen changes, so
+  /// nothing repaints.
+  QTimer ocrFadeTimer_;
 };
 
 [[nodiscard]] QPointF constrainedCreationEndpoint(CaptureEditor::Tool tool,
