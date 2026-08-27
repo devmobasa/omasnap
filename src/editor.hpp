@@ -1,5 +1,6 @@
 #pragma once
 
+#include "background-config.hpp"
 #include "capture.hpp"
 #include "cut.hpp"
 #include "overlay-chrome.hpp"
@@ -75,6 +76,11 @@ public:
    * event loop run so completeFinish() can act. Headless smoke suite only.
    */
   void waitForExport();
+  /**
+   * Blocks until an in-flight recents-shelf reopen has completed, letting
+   * the event loop run. Headless smoke suite only.
+   */
+  void waitForReopen();
   /** Renders the current selection and layer data for headless verification. */
   [[nodiscard]] QImage renderCurrentOutput() const;
   /**
@@ -87,6 +93,22 @@ public:
   /** Current monitor data (background capture may be in flight). */
   const CaptureData &captureData() const { return capture_; }
   [[nodiscard]] QRectF currentSelection() const { return selection_; }
+  /** Annotation-space canvas, including any strips grown past the source. */
+  [[nodiscard]] QRectF currentCanvasForTest() const { return canvasRect_; }
+  [[nodiscard]] CanvasBoundaryMode currentCanvasBoundaryForTest() const {
+    return canvasBoundaryMode_;
+  }
+  /** Fitted canvas and source-frame geometry used by headless interactions. */
+  [[nodiscard]] QRectF sourceFrameWidgetRectForTest() const {
+    return sourceFrameWidgetRect();
+  }
+  [[nodiscard]] QPointF annotationPointToWidgetForTest(
+      const QPointF &point) const {
+    return sourceFrameWidgetRect().topLeft() + point * editScale();
+  }
+  [[nodiscard]] const QVector<Annotation> &currentAnnotationsForTest() const {
+    return annotations_;
+  }
   [[nodiscard]] const QVector<Operation> &operationLog() const { return ops_; }
   [[nodiscard]] int operationIndex() const { return opIndex_; }
   [[nodiscard]] QString workingSourcePath() const { return snapshotPath_; }
@@ -104,6 +126,7 @@ protected:
   bool eventFilter(QObject *watched, QEvent *event) override;
   void keyPressEvent(QKeyEvent *event) override;
   void keyReleaseEvent(QKeyEvent *event) override;
+  void leaveEvent(QEvent *event) override;
   void mouseMoveEvent(QMouseEvent *event) override;
   void mouseDoubleClickEvent(QMouseEvent *event) override;
   void mousePressEvent(QMouseEvent *event) override;
@@ -130,8 +153,9 @@ public:
   };
 
 private:
-  enum class Phase { Select, Edit };
+  enum class Phase { Select, Export, Edit };
   enum class OutputMode { Copy, Save, Both };
+  enum class HighlighterMode { Snap, Normal };
 public:
   enum class Interaction {
     None,
@@ -183,10 +207,21 @@ private:
     /// Small flattened preview for the recents shelf.
     QImage thumbnail;
   };
+  /// What reopening a shelved capture reads off disk: the full-resolution
+  /// source plus its operation log. Loaded on the worker pool, not the UI
+  /// thread, since a shelved stitched capture can be tens of megapixels.
+  struct ReopenResult {
+    RecentSnap recent;
+    QImage image;
+    OperationLog log;
+    QString error;
+  };
 
   struct EditState {
     QVector<Annotation> annotations;
     BackgroundStyle backgroundStyle = BackgroundStyle::None;
+    bool imageShadow = true;
+    CanvasBoundaryMode canvasBoundary = CanvasBoundaryMode::Framed;
     QRectF selection;
     int selectedAnnotation = -1;
     QVector<int> selectedAnnotations;
@@ -195,7 +230,6 @@ private:
   };
 
   [[nodiscard]] QRectF annotationBounds(const Annotation &annotation) const;
-  [[nodiscard]] QRectF selectedAnnotationsBounds() const;
   void selectAllAnnotations();
   [[nodiscard]] bool annotationSelected(int index) const;
   /// What a pointer event reports, or nothing until a key event has confirmed
@@ -230,6 +264,9 @@ public:
   /// Currently armed tool. Test accessor: cursor shape is a poor proxy, since
   /// what is under the pointer changes it.
   [[nodiscard]] Tool armedToolForTest() const { return tool_; }
+  /// Apply a cut as if the user had dragged that band. Test hook: operate on
+  /// a fixture raster without going through widget coordinates.
+  void applyCutForTest(CutOp cut) { commitCut(std::move(cut)); }
   /// Number of selected layers. Test accessor.
   [[nodiscard]] int selectedCountForTest() const {
     return static_cast<int>(selectedAnnotations_.size());
@@ -257,6 +294,16 @@ public:
   }
   /// Current status line. Test accessor.
   [[nodiscard]] QString statusForTest() const { return status_; }
+  /// Text-height I-beam in annotation coordinates, or an empty rect when the
+  /// Snap highlighter has no text row near the pointer. Test accessor.
+  [[nodiscard]] QRectF highlighterPreviewRectForTest() const;
+  /// Whether the highlighter is in its default text-row snapping mode.
+  [[nodiscard]] bool highlighterSnapModeForTest() const {
+    return highlighterMode_ == HighlighterMode::Snap;
+  }
+  /// Active highlighter button geometry. Test accessor for repeated-tool
+  /// behavior without duplicating the responsive toolbar layout.
+  [[nodiscard]] QRectF highlighterToolbarRectForTest() const;
   /// Whether the selection chrome is currently stepped back for an adjustment.
   /// Test accessor.
   [[nodiscard]] bool selectionFadedForTest() const {
@@ -271,8 +318,48 @@ public:
   [[nodiscard]] bool shapeMenuOpenForTest() const { return shapeMenuOpen_; }
   /// Whether window selection is active in the select phase. Test accessor.
   [[nodiscard]] bool windowModeForTest() const { return windowMode_; }
+  /// Where the image is drawn on screen right now (widget pixels), and the
+  /// annotation-space-to-widget scale. Test accessor: lets a test compute
+  /// exact click/expectation points from real geometry instead of hand math.
+  [[nodiscard]] QRectF editImageRectForTest() const { return editImageRect(); }
+  [[nodiscard]] qreal editScaleForTest() const { return editScale(); }
+  [[nodiscard]] QPointF toAnnotationPointForTest(const QPointF &widget) const {
+    return toAnnotationPoint(widget);
+  }
+  /// Inverse of toAnnotationPoint: annotation-space → widget pixels.
+  [[nodiscard]] QPointF toScreenPointForTest(const QPointF &annotation) const {
+    const qreal scale = editScale();
+    return editImageRect().topLeft() +
+           annotation * (scale > 0.001 ? scale : 0.001);
+  }
+  /// Center of the toolbar button whose action is `action` (e.g.
+  /// "tool-arrow"), or (-1,-1) if not found. Test accessor: a click position
+  /// that survives the toolbar's own layout changing.
+  [[nodiscard]] QPoint toolbarButtonCenterForTest(const QString &action) const {
+    const QRectF button = toolbarButtonRectForTest(action);
+    return button.isEmpty() ? QPoint(-1, -1) : button.center().toPoint();
+  }
+  [[nodiscard]] QRectF toolbarButtonRectForTest(const QString &action) const {
+    for (const ToolbarButton &button : toolbarButtons())
+      if (button.action == action)
+        return button.rect;
+    return {};
+  }
+  [[nodiscard]] QRectF colorPaletteRectForTest() const {
+    return colorPaletteRect();
+  }
+  [[nodiscard]] QRectF customColorPanelRectForTest() const {
+    return customColorPanelRect();
+  }
+  [[nodiscard]] QRectF textSizePanelRectForTest() const {
+    return textSizePanelRect();
+  }
   /// Whether the overlay is still in the select phase. Test accessor.
   [[nodiscard]] bool selectingForTest() const { return phase_ == Phase::Select; }
+  /// Whether a confirmed quick capture is being exported without showing Edit.
+  [[nodiscard]] bool exportingForTest() const { return phase_ == Phase::Export; }
+  /// Whether the annotation editor is visible. Test accessor.
+  [[nodiscard]] bool editingForTest() const { return phase_ == Phase::Edit; }
   /// Widget rect of the capture-kind tab with `label`, or null. Test accessor.
   [[nodiscard]] QRectF selectTabRectForTest(const QString &label) const {
     for (const CaptureTab &item : selectTabItems())
@@ -299,6 +386,9 @@ private:
   /// What the armed tool is currently set to, for the status line: shown on
   /// arming so its options are discoverable without trying them.
   [[nodiscard]] QString toolStatus() const;
+  [[nodiscard]] QString highlighterStatus() const;
+  [[nodiscard]] QString highlighterTooltip() const;
+  void activateHighlighter();
   [[nodiscard]] int annotationAt(const QPointF &point) const;
   /// Whether the armed tool picks a layer up rather than working over it.
   /// Moves a layer to the top of the stack, remapping every index that
@@ -326,12 +416,17 @@ private:
   [[nodiscard]] int cropHandleAt(const QPointF &point) const;
   /// Fit-to-window rect for the selection (unaffected by the view zoom/pan).
   [[nodiscard]] QRectF baseImageRect() const;
-  /// Top edge the chrome (toolbar, popovers) anchors above: the fit rect at
-  /// zoom 1, the viewport band once zoomed (the content fills it then).
-  [[nodiscard]] qreal chromeAnchorTop() const;
+  /// Top of the toolbar row: just under the tab strip's fixed bottom edge,
+  /// independent of the image, so the two can never overlap.
+  [[nodiscard]] qreal toolbarTop() const;
+  /// How much vertical room the tab strip and toolbar actually need, at the
+  /// current window width — the image's top margin, not a guessed constant.
+  [[nodiscard]] qreal imageTopMargin() const;
   /// baseImageRect transformed by the current view zoom and pan (content and
   /// annotations map through this). Equals baseImageRect at zoom 1.
   [[nodiscard]] QRectF editImageRect() const;
+  /// The unmodified screenshot's frame inside the possibly-grown canvas.
+  [[nodiscard]] QRectF sourceFrameWidgetRect() const;
   [[nodiscard]] qreal editScale() const;
   /// Multiplier from the fit scale to the largest useful zoom (1 source px ->
   /// a few screen px); 1.0 when the image already fits comfortably.
@@ -344,6 +439,10 @@ private:
   void clampViewOffset();
   [[nodiscard]] QPointF toAnnotationPoint(const QPointF &position) const;
   [[nodiscard]] QPointF toUnclampedAnnotationPoint(const QPointF &position) const;
+  /// Counters sit just ahead of the pointing-hand hotspot, as though its tip
+  /// is placing them. The lead is screen-space so zooming never moves the
+  /// counter closer to or farther from the cursor.
+  [[nodiscard]] QPointF markerPlacementPoint(const QPointF &position) const;
   [[nodiscard]] bool selectedLayerAcceptsPoint(const QPointF &point) const;
   [[nodiscard]] QRectF sourceRect(const QRectF &logicalRect) const;
   [[nodiscard]] QPointF sourcePoint(const QPointF &logicalPoint) const;
@@ -351,7 +450,14 @@ private:
   [[nodiscard]] QRectF mapPreviewToWidget(const QRectF &previewRect) const;
   [[nodiscard]] int windowAt(const QPointF &position) const;
   [[nodiscard]] int windowInDirection(int current, int key) const;
-  [[nodiscard]] QVector<ToolbarButton> toolbarButtons() const;
+  /// Toolbar buttons laid out left to right in their logical groups
+  /// (history, style, tools, actions). When `groupDividers` is non-null, the
+  /// midpoint x of each gap between groups is appended to it, in widget
+  /// space, for the divider lines drawn between clusters.
+  [[nodiscard]] QVector<ToolbarButton>
+  toolbarButtons(QVector<qreal> *groupDividers = nullptr,
+                 bool includeSubmenus = true) const;
+  [[nodiscard]] QRectF toolbarButtonRect(const QString &action) const;
   [[nodiscard]] QColor annotationColor() const;
   [[nodiscard]] QLineF creationSpan(const QPointF &rawEnd) const;
   [[nodiscard]] QPointF
@@ -418,9 +524,21 @@ private:
   void trackRecentsHover();
   void paintRecents(QPainter &painter);
   void reopenRecent(int index);
+  void completeReopenRecent(const ReopenResult &result);
+  void completeBackdropLoad();
+  void seedConfiguredBackground(BackgroundStyle style);
   void duplicateSelectedAnnotation();
   [[nodiscard]] EditState editState() const;
+  void refreshCanvasRect();
+  [[nodiscard]] bool canvasGrown() const;
+  [[nodiscard]] BackgroundStyle effectiveBackgroundStyle() const;
   void enterEdit(QString status);
+  /// Routes a confirmed screen selection to quick export or the editor.
+  void enterSelectedCapture(QString editStatus);
+  /// A confirmed quick capture exports in place without exposing editor chrome.
+  void enterExport();
+  void ensureTextEditor();
+  [[nodiscard]] bool textEditing() const;
 public:
 
 private:
@@ -433,7 +551,10 @@ private:
   void commitDelete(const QVector<int> &indices);
   void commitCrop(const QRectF &crop);
   void commitCut(CutOp cut);
-  void commitBackground(BackgroundStyle style);
+  void commitBackground(BackgroundStyle style, bool imageShadow);
+  void commitCanvasBoundary(CanvasBoundaryMode mode);
+  void cycleCanvasBoundary(bool reverse);
+  void cycleBackground();
   void replayLog();
   void redoEdit();
   void selectWindowInDirection(int key);
@@ -451,6 +572,7 @@ private:
   void setStatus(QString status);
   void toggleShapeFill();
   void toggleTextBackground();
+  void cycleTextFont();
   void nudgeSelectedAnnotation(const QPointF &delta);
   void endNudgeRun();
   /// Wheel over a selected layer: weight, not size. Thickness for anything
@@ -506,6 +628,10 @@ private:
   QElapsedTimer recentsAnimClock_;
   QTimer recentsAnimTimer_;
   QRectF selection_;
+  // Annotation coordinates stay anchored to the source frame at 0,0. This
+  // derived rect expands around them without translating either the source or
+  // existing layers; replaying the op log reconstructs it exactly.
+  QRectF canvasRect_;
   QPointF dragStart_;
   QRectF originalSelection_;
   QRectF cropDragImageRect_;
@@ -519,6 +645,20 @@ private:
   bool resizeConstraintActive_ = false;
   Interaction interaction_ = Interaction::None;
   QVector<QPointF> freehandPoints_;
+  struct HighlighterLock {
+    qreal centerY = 0.0;
+    qreal annotationSize = 0.0;
+  };
+  [[nodiscard]] std::optional<HighlighterLock>
+  highlighterLockAt(const QPointF &annotationPoint) const;
+  /// Set when a highlighter drag begins near a detected screenshot text row.
+  /// Coordinates and size are selection-relative logical pixels, so the lock
+  /// survives view zoom and native/fractional monitor scaling.
+  std::optional<HighlighterLock> highlighterLock_;
+  /// Detected row supplying the Snap cursor's height. Before mouse-down its
+  /// center follows the pointer; during a locked drag it follows the row.
+  std::optional<HighlighterLock> highlighterPreview_;
+  HighlighterMode highlighterMode_ = HighlighterMode::Snap;
   // Cut tool live-drag state. cutDragStart_/cutBandLo_/cutBandHi_ and
   // liveCut_.orientation are in annotation space (selection-relative logical
   // px); the source stays untouched while a shaded removal band previews the
@@ -532,6 +672,16 @@ private:
   qreal cutDragOriginOffset_ = 0.0;
   bool windowMode_ = false;
   BackgroundStyle backgroundStyle_ = BackgroundStyle::None;
+  bool imageShadow_ = true;
+  CanvasBoundaryMode canvasBoundaryMode_ = CanvasBoundaryMode::Framed;
+  /** `[background]` config: custom image path and the style a fresh capture
+   *  starts with. Loaded once in the constructor. */
+  BackgroundConfig backgroundConfig_;
+  /** Loaded from `backgroundConfig_.imagePath`; null when unset or the file
+   *  failed to load, in which case `BackgroundStyle::Custom` is unavailable. */
+  QImage customBackdrop_;
+  bool configuredCustomDefaultPending_ = false;
+  std::optional<QString> pendingSelectedCapture_;
   bool busy_ = false;
   bool colorPaletteOpen_ = false;
   bool customColorPickerOpen_ = false;
@@ -557,6 +707,9 @@ private:
   QTimer adjustSettleTimer_;
   int textSizeIndex_ = 1;
   TextBackground textBackground_ = TextBackground::Pill;
+  /// Typeface for the next label; Shift+T cycles it without changing Neucha's
+  /// role as the session default.
+  TextFont textFont_ = TextFont::Neucha;
   qreal spotlightMagnification_ = 2.0;
   /// Ring drawn around a spotlight's opening; 0 draws none.
   qreal spotlightBorder_ = 4.0;
@@ -572,8 +725,7 @@ private:
   QImage redactionBase_;
   QSize redactionBaseSize_;
   bool redactionBaseStale_ = true;
-  // Select-phase capture scaled once per source, widget size, and DPR.
-  QPixmap backdrop_;
+  // Select-phase capture scaled and dimmed once per source, widget size, and DPR.
   QPixmap dimmedBackdrop_;
   QSize backdropSize_;
   qreal backdropRatio_ = 0.0;
@@ -597,11 +749,18 @@ private:
   QFutureWatcher<CaptureJob> captureWatcher_;
   bool capturePending_ = false;
   bool captureStarted_ = false;
+  bool firstPaintReported_ = false;
   CaptureMode pendingMode_ = CaptureMode::Region;
   // Background render for --pin.
-  QFutureWatcher<QImage> pinWatcher_;
+  /// Path on success, empty + error set on failure. The render and the PNG
+  /// write both happen in the worker; nothing but launching the pin process
+  /// happens back on the UI thread.
+  struct PinResult {
+    QString path;
+    QString error;
+  };
+  QFutureWatcher<PinResult> pinWatcher_;
   bool pinPending_ = false;
-  QString pendingPinPath_;
   QVector<Annotation> annotations_;
   QVector<Operation> ops_;
   int opIndex_ = 0;
@@ -622,10 +781,13 @@ private:
   QVector<Annotation> originalSelectedAnnotations_;
   QVector<int> selectedAnnotations_;
   qreal textSize_ = 4.0;
+  /// Typeface held by the active inline draft (existing layer or next-label
+  /// default), kept alongside textSize_ so its baseline does not jump.
+  TextFont textEditFont_ = TextFont::Neucha;
   QElapsedTimer escapeTimer_;
   /// The inline editor's pill and caret are painted by the editor itself
   /// (the multiline editor stays transparent with its own caret hidden) so the
-  /// caret can be shorter than Neucha's tall line box.
+  /// caret follows the selected face's glyph box instead of its whole line box.
   bool textEditPill_ = false;
   /// How many lines the current text entry has room for (see beginText).
   int textLineCapacity_ = 1;
@@ -643,6 +805,9 @@ private:
   QColor textColor_;
   QFutureWatcher<OcrResult> ocrWatcher_;
   QFutureWatcher<FinishResult> finishWatcher_;
+  QFutureWatcher<ReopenResult> reopenWatcher_;
+  QFutureWatcher<QImage> backdropWatcher_;
+  bool reopenPending_ = false;
   /// The region being read (annotation coordinates). While tesseract runs a
   /// scan band sweeps it; once done the recognized text sits over it for a
   /// few seconds (or until the next click/key) so you can see what was copied.

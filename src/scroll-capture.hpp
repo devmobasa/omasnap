@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <utility>
 #include <optional>
 
 class QWindow;
@@ -90,6 +91,10 @@ public:
   /// Take over with `region` (logical surface pixels, clamped to the
   /// surface and the chrome strip) already drawn. Call once, after show().
   void begin(const QRect &region);
+  /// Stops any worker, hands the surface back whole (no hole, keyboard
+  /// exclusive again) and hides. Safe to call from inside one of this
+  /// panel's own signals; the destructor calls it too.
+  void release();
 
 signals:
   /// The capture is done: `image` is the stitched result.
@@ -149,6 +154,9 @@ private:
   void updateKeyboardZone(const QPoint &point);
   /// Restarts the capture in the other mode, keeping the region.
   void switchMode(Mode mode);
+  /// Where the injector parks the pointer for auto-scroll (physical pixels):
+  /// the region's bottom-right corner, inset 10% so it stays inside it.
+  [[nodiscard]] std::pair<int, int> autoScrollParkPoint() const;
   /// Rects the overlay must keep taking clicks in the current phase.
   [[nodiscard]] QVector<QRect> chromeRects() const;
   void setStatus(const QString &status, bool warning = false);
@@ -204,6 +212,7 @@ private:
   /// in the session, so it can be picked up again.
   bool autoStalled_ = false;
   void reserveChromeStrip();
+  bool released_ = false;
   /// The top-level window's handle, for the input mask.
   [[nodiscard]] QWindow *surfaceWindow() const;
   /// The grip being dragged, and what the region and pointer were when it

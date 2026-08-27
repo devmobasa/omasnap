@@ -44,18 +44,22 @@ QColor captureTabAccent(CaptureKind kind) {
 } // namespace
 
 QVector<CaptureTab> captureTabLayout(const QRect &bounds) {
-  static const CaptureKind order[] = {CaptureKind::Region, CaptureKind::Scroll,
-                                      CaptureKind::Window,
+  static const CaptureKind order[] = {CaptureKind::Region, CaptureKind::Window,
+                                      CaptureKind::Scroll,
                                       CaptureKind::Fullscreen};
   const QFontMetricsF metrics(captureTabFont());
   constexpr qreal kPad = 14.0;
   constexpr qreal kGap = 2.0;
   constexpr qreal kHeight = 26.0;
+  // Flush to the top edge (see drawCaptureTabs' -30 background extension):
+  // derived from kCaptureTabBarBottom rather than a separate magic number,
+  // so the two can't drift apart.
+  constexpr qreal kTop = kCaptureTabBarBottom - kHeight - 5.0;
   QVector<CaptureTab> tabs;
   qreal total = 0.0;
   for (const CaptureKind kind : order) {
     const qreal w = metrics.horizontalAdvance(captureTabLabel(kind)) + 2 * kPad;
-    tabs.push_back({kind, QRectF(total, 5.0, w, kHeight)});
+    tabs.push_back({kind, QRectF(total, kTop, w, kHeight)});
     total += w + kGap;
   }
   total -= kGap;
@@ -132,87 +136,35 @@ QRectF drawModeBadge(QPainter &painter, const QRect &bounds,
 }
 
 void drawHotkeyLegend(QPainter &painter, const QRect &bounds,
-                      const QPointF &cursor,
-                      const QVector<QPair<QString, QString>> &entries,
-                      const QVector<QPointF> &keepVisible) {
+                      const QVector<QPair<QString, QString>> &entries) {
   if (entries.isEmpty())
     return;
-  constexpr int columns = 2;
-  const int rows = (entries.size() + columns - 1) / columns;
   QFont font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
   font.setPixelSize(11);
-  // Measured, not guessed: a fixed-width card clipped the longer lines, and a
-  // guide that trails off mid-word is worse than no guide.
   const QFontMetricsF metrics(font);
-  constexpr qreal keyGap = 12;    // between a key and what it does
-  constexpr qreal columnGap = 24; // between the two columns
-  constexpr qreal padding = 12;   // card edge to text
-  qreal keyWidth[columns] = {};
-  qreal textWidth[columns] = {};
-  for (int index = 0; index < entries.size(); ++index) {
-    const int column = std::min(index / rows, columns - 1);
-    keyWidth[column] = std::max(
-        keyWidth[column], metrics.horizontalAdvance(entries.at(index).first));
-    textWidth[column] = std::max(
-        textWidth[column], metrics.horizontalAdvance(entries.at(index).second));
-  }
-  qreal columnWidth[columns] = {};
-  qreal width = 2 * padding;
-  for (int column = 0; column < columns; ++column) {
-    if (keyWidth[column] <= 0 && textWidth[column] <= 0)
-      continue;
-    columnWidth[column] = keyWidth[column] + keyGap + textWidth[column];
-    width += columnWidth[column];
-    if (column > 0)
-      width += columnGap;
-  }
-  width = std::min(width, bounds.width() - 28.0);
-  const qreal height = rows * 19 + 24;
-  const QRectF right(bounds.width() - width - 14, 14, width, height);
-  const QRectF left(14, 14, width, height);
-  auto hiddenCount = [&](const QRectF &candidate) {
-    int count = 0;
-    for (const QPointF &point : keepVisible) {
-      if (candidate.contains(point))
-        ++count;
-    }
-    return count;
-  };
-  // Flip away from the pointer, but not onto a selected handle. Adding Cut
-  // grew the card far enough that a line-select click near mid-canvas moved
-  // it over the start handle.
-  const bool cursorWantsLeft =
-      right.adjusted(-28, -28, 28, 28).contains(cursor);
-  QRectF panel = cursorWantsLeft ? left : right;
-  const QRectF other = cursorWantsLeft ? right : left;
-  if (hiddenCount(panel) > hiddenCount(other))
-    panel = other;
-  // The flip exists so the guide never sits on what the pointer is doing.
-  // When both positions would still cover the pointer and no handle pins the
-  // card in place, there is nowhere honest to put it: step aside entirely.
-  // On any real monitor the two positions cannot both reach the pointer.
-  if (keepVisible.isEmpty() &&
-      panel.adjusted(-28, -28, 28, 28).contains(cursor) &&
-      other.adjusted(-28, -28, 28, 28).contains(cursor))
-    return;
-
-  painter.setPen(QPen(QColor(255, 255, 255, 34), 1));
-  painter.setBrush(QColor(13, 15, 20, 224));
-  painter.drawRoundedRect(panel, 11, 11);
+  constexpr qreal keyGap = 10;    // between a key and what it does
+  constexpr qreal marginLeft = 14;
+  constexpr qreal marginBottom = 14;
+  constexpr qreal rowHeight = 17;
+  qreal keyWidth = 0.0;
+  for (const auto &entry : entries)
+    keyWidth = std::max(keyWidth, metrics.horizontalAdvance(entry.first));
   painter.setFont(font);
+  // Bottom-left, growing upward: entry 0 is the bottom-most row. No card, no
+  // border, no dodging the pointer or anything else — the caller draws this
+  // early, so real chrome painted afterward simply covers it where the two
+  // overlap, and the low opacity keeps it out of the way where nothing does.
   for (int index = 0; index < entries.size(); ++index) {
-    const int column = std::min(index / rows, columns - 1);
-    const int row = index % rows;
-    qreal x = panel.left() + padding;
-    for (int before = 0; before < column; ++before)
-      x += columnWidth[before] + columnGap;
-    const qreal y = panel.top() + 12 + row * 19;
-    painter.setPen(QColor(QStringLiteral("#a9b6cb")));
-    painter.drawText(QRectF(x, y, keyWidth[column], 18),
+    const qreal y =
+        bounds.height() - marginBottom - (index + 1) * rowHeight;
+    painter.setPen(QColor(169, 182, 203, 165));
+    painter.drawText(QRectF(marginLeft, y, keyWidth, rowHeight - 2),
                      Qt::AlignLeft | Qt::AlignVCenter, entries.at(index).first);
-    painter.setPen(QColor(QStringLiteral("#f5f5f7")));
+    painter.setPen(QColor(199, 204, 214, 130));
     painter.drawText(
-        QRectF(x + keyWidth[column] + keyGap, y, textWidth[column], 18),
+        QRectF(marginLeft + keyWidth + keyGap, y,
+               bounds.width() - marginLeft - keyWidth - keyGap - 14,
+               rowHeight - 2),
         Qt::AlignLeft | Qt::AlignVCenter, entries.at(index).second);
   }
 }

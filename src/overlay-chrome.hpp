@@ -22,6 +22,11 @@ struct CaptureTab {
   CaptureKind kind;
   QRectF rect;
 };
+/// Visible height of the tab strip's background, from the top edge (the
+/// strip is flush against it) to its rounded bottom — fixed regardless of
+/// window size, since only the horizontal layout changes with the surface.
+/// Chrome stacked below the strip anchors to this, not a guessed constant.
+constexpr qreal kCaptureTabBarBottom = 31.0;
 [[nodiscard]] QString captureTabLabel(CaptureKind kind);
 /// Tab positions for a surface of `bounds`, hanging off the top edge.
 [[nodiscard]] QVector<CaptureTab> captureTabLayout(const QRect &bounds);
@@ -39,13 +44,15 @@ QRectF drawModeBadge(QPainter &painter, const QRect &bounds,
                      const QString &label, const QColor &accent,
                      QRectF *closeRect = nullptr);
 
-/// The two-column key guide, pinned to the top-right corner, and moved to the
-/// left when the pointer is over it, so it never hides what is underneath.
-/// `keepVisible` are points (selected handles) the card must not cover.
+/// A single, backgroundless column of `key  action` pairs along the bottom
+/// left, growing upward, in low-opacity text. Hotkeys are a reference, not
+/// UI: there is no card, no border, and no attempt to dodge the pointer or
+/// dodge anything else — draw it early (right after the overlay's initial
+/// dim fill, before the image, the tab strip, the toolbar, any popup) and
+/// normal paint order does the rest, since whatever is drawn afterward
+/// simply covers it wherever the two overlap.
 void drawHotkeyLegend(QPainter &painter, const QRect &bounds,
-                      const QPointF &cursor,
-                      const QVector<QPair<QString, QString>> &entries,
-                      const QVector<QPointF> &keepVisible = {});
+                      const QVector<QPair<QString, QString>> &entries);
 
 /// The instruction line along the bottom.
 void drawStatusPill(QPainter &painter, const QRect &bounds,

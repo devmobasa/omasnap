@@ -16,14 +16,25 @@ resizable vector layers and preserves the monitor's native pixels on scaled disp
 - Window capture is a crop of the focused-monitor frame. Overlapping windows stay
   visible; there is no second clean-window recapture.
 - Select/move/resize layers, mouse-wheel scaling, and eight external recropping handles.
-- Arrows, straight lines, smoothed freehand strokes, translucent highlighter strokes,
-  hollow or filled rectangles (optionally rounded) and ellipses, numbered markers,
-  editable Neucha text (on a readability pill), and secure redaction with opaque or
-  randomized non-spatial mosaic output.
+- Draw, type, resize, or carry a layer past the screenshot edge to grow the canvas.
+  Framed growth is the default; `G` cycles to tight Overflow growth (only the
+  sides needed by annotations, with no frame), then Image (the original canvas
+  size, clipping every outside annotation). `Shift+G` cycles backward without
+  changing layer geometry. New framed strips start in window gray with the
+  original screenshot's card shadow. `B` cycles through the colorful backdrops,
+  shadowed and flat window gray, and Off so a background can always be removed.
+  Overflow with no backdrop leaves its added pixels transparent. `Shift+B`
+  toggles the current shadow directly, and undo/delete can contract grown strips.
+- Arrows, straight lines, smoothed freehand strokes, and translucent highlighter
+  strokes that automatically match and stay straight across screenshot text (with
+  freehand fallback), plus hollow or filled rectangles (optionally rounded) and
+  ellipses, numbered markers, editable text in Neucha, JetBrains Mono, or Inter
+  Display (plain, outlined, or on a readability pill), and secure redaction with
+  opaque or randomized non-spatial mosaic output.
 - Per-layer preset or custom colors (including highlighter ink), undo/redo history,
   one-click whole-image or drag-region OCR (the recognized text is shown beside
   the image and copied to the clipboard),
-  mesh-gradient backdrops, and rendered drop shadows.
+  mesh-gradient backdrops, and rendered drop shadows on standard backdrop cards.
 - Cut tool: drag across a band of the image to remove it and collapse the gap, with a
   live preview and dashed seam marker while dragging; annotations shift to follow.
 - Pin a finished capture as a bottom-right always-on-top layer surface, launched
@@ -137,6 +148,8 @@ The install step places:
 - `~/.local/bin/omasnap`
 - `~/.local/share/applications/omasnap.desktop`
 - `~/.local/share/licenses/omasnap/Neucha-OFL.txt`
+- `~/.local/share/licenses/omasnap/JetBrainsMono-OFL.txt`
+- `~/.local/share/licenses/omasnap/Inter-OFL.txt`
 
 Ensure `~/.local/bin` is on `PATH`, then verify the installed CLI:
 
@@ -268,6 +281,17 @@ filename = screenshot-{date}_{time}-{app}
 # Up to eight preset colors for the palette, and the initial custom color.
 palette = #ff375f, #ff9f0a, #ffd60a, #30d158, #0a84ff, #bf5af2, #000000, #ffffff
 custom = #ff375f
+
+[background]
+# An image used as a "Custom" backdrop. B (or the toolbar button) cycles
+# through the four gradients, this image when readable, shadowed/flat window
+# gray, and Off.
+image = ~/Pictures/backdrops/desk.jpg
+# Style a fresh capture starts with: none, off, slate, aurora, sunset, lagoon,
+# violet, or custom. `none` still allows Framed canvas growth to add its
+# automatic window-gray mat; `off` stays transparent. `custom` only takes
+# effect once `image` above loads successfully.
+default = custom
 ```
 
 Filename tokens:
@@ -302,7 +326,7 @@ Install the corresponding Tesseract language data before adding a language to
 ### Capture selection
 
 Tabs across the top of the overlay switch the capture kind: **Region**,
-**Scrolling Region**, **Window**, **Fullscreen**. All four are modes of the
+**Window**, **Scrolling Region**, **Fullscreen**. All four are modes of the
 same overlay. Scrolling Region selects exactly like Region; once the region is
 drawn, the page inside it goes live and the scroll controls appear in place.
 The tabs stay up in the editor too: a tab there drops the edit and goes back to
@@ -313,7 +337,7 @@ without reaching for the pointer.
 | Input | Action |
 |---|---|
 | Drag | Select a region, with its native pixel size shown at the pointer |
-| `Space` | Step through the capture-kind tabs (Region, Scrolling Region, Window) |
+| `Space` | Step through the capture-kind tabs (Region, Window, Scrolling Region) |
 | `S` | Toggle scrolling-region mode |
 | `R` | Restore the last region drawn this session (same monitor) |
 | `SUPER + Arrow` | Move among windows in window mode |
@@ -326,20 +350,24 @@ without reaching for the pointer.
 
 | Input | Action |
 |---|---|
-| `V` | Select/move/resize layers; drag empty canvas for a marquee; wheel scales the selected layer |
+| `V` | Select/move/resize layers; carrying one past the source grows the canvas; drag empty canvas for a marquee; multi-select outlines each layer without treating the canvas as one layer; wheel scales the selected layer |
 | `A` | Arrow |
 | `S` | Spotlight/loupe; press again to cycle ellipse, rectangle, rounded |
 | `L` | Straight line |
 | `F` | Freehand stroke |
+| `H` | Highlighter; Snap mode uses a mouse-following I-beam at the nearby text height, then locks the drag straight to that row. Press `H` again (or click the active toolbar button) for Normal freehand mode, where wheel or `Alt`+wheel changes thickness; Snap keeps detected-row height automatic and wheel sets only its off-text fallback |
 | `I` | Eyedropper in the color popover · sample the image as the custom color |
 | `C` | Numbered marker |
 | `R` | Rectangle; hover the shape button for rectangle, ellipse, and fill controls; `Alt`+wheel rounds corners |
 | `E` | Ellipse; shares the shape submenu and filled/hollow toggle |
 | `D` | Redact; press again to toggle randomized pixelation or solid redaction |
 | `X` | Cut out a band; drag to preview the crossed-out strip, then release to remove and collapse it |
-| `T` | Neucha text on a cream readability pill. Click for a one-line label, or drag a box to give it room for several lines: Enter moves to the next line while there is room and commits on the last one; `Shift+Enter` always adds a line; `Esc` commits too but keeps the label selected, so `Backspace` removes it; clicking away keeps the text; press T again to toggle the pill |
+| `T` | Text on a cream readability pill, with Neucha as the default. Click for a one-line label, or drag a box to give it room for several lines: Enter moves to the next line while there is room and commits on the last one; `Shift+Enter` always adds a line; `Esc` commits too but keeps the label selected, so `Backspace` removes it; clicking away keeps the text; press T again to toggle the pill |
+| `Shift+T` | Cycle the next or selected text through Neucha, JetBrains Mono, and Inter Display |
 | `O` | Recognize and copy all text in the current image |
-| `B` | Cycle backdrop |
+| `B` | Cycle shadowed colors, window gray (shadowed and flat), and Off |
+| `Shift+B` | Toggle the screenshot card's drop shadow; on by default |
+| `G` / `Shift+G` | Cycle canvas boundaries forward/backward: Framed, Overflow, Image. Framed auto-grows with the normal frame; Overflow grows only the sides needed by annotations with no frame; Image clips at the original screenshot edge |
 | `1`–`8` | Set annotation color; `7` is black and `8` is white |
 | Wheel | Scale selected layer, magnify the spotlight under the cursor, or change active tool size (`Alt`+wheel: rectangle corner radius or spotlight border); while just viewing a zoomed capture, scroll it like a document |
 | `Shift`+wheel | Scroll a zoomed capture sideways (a wide stitch); never changes the zoom |
@@ -390,10 +418,14 @@ Image and path copying use `wl-copy` rather than `QClipboard`, so clipboard data
 available after the pin is closed. No font-based symbol set or compositor-specific window
 rule is required; the controls use the same vector icon renderer as the annotation toolbar.
 
+Canvas boundary changes affect only preview and export clipping. The complete vector
+geometry stays in the operation log, so switching back to Grow restores every off-canvas
+part of a layer.
+
 Creation tools return to Select after one placement without selecting the new layer. In
 Select mode, arrows and lines show only their two endpoint handles; other layers show a
 selection boundary. The eight blue/white handles outside the image recrop its corners or
-edges.
+edges. After the canvas grows, those crop handles remain on the original source frame.
 
 ## Development and verification
 
@@ -404,8 +436,20 @@ make check
 The smoke executable exercises region/window/fullscreen startup modes, capture selection,
 working-document persistence (source plus op-log JSON), annotation tools, undo/redo
 replay, vector movement and scaling, text editing, OCR, native-DPI output,
-endpoint-only line selection, external crop handles, and the native-pixel
+endpoint-only line selection, annotation-driven canvas growth and clipping policies,
+external crop handles,
+and the native-pixel
 measurement readout on a scaled monitor.
+
+For live launch profiling, the binary has an opt-in millisecond trace from `main()`
+through the first completed overlay paint:
+
+```bash
+OMASNAP_PROFILE_STARTUP=1 ./build/omasnap 2>startup.log
+```
+
+The trace also breaks native capture into Wayland registry, buffer allocation, frame wait,
+and pixel handoff stages. It is completely silent by default.
 
 `.github/workflows/build-linux.yml` runs the same `make check` build, interaction smoke,
 and available static-analysis checks in an Arch Linux container, stages the CMake installation, and uploads a versioned Linux
@@ -430,5 +474,6 @@ This standalone repository was extracted with `git filter-repo` from the origina
 system-customization repository. The former `omasnap/` directory was promoted to
 the repository root while retaining its relevant commit history.
 
-The bundled Neucha font is distributed under the SIL Open Font License; its license is in
-`assets/OFL.txt` and is installed with the application.
+The bundled Neucha, JetBrains Mono, and Inter Display fonts are distributed
+under the SIL Open Font License. Their provenance and hashes are recorded in
+`assets/FONTS.md`; their licenses are installed with the application.

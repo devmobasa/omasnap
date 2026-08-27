@@ -10,6 +10,8 @@
 #include "palette-config.hpp"
 #include "recent-snaps.hpp"
 #include "scroll-capture.hpp"
+#include "startup-timing.hpp"
+#include "text-band.hpp"
 
 #include <QtConcurrent/QtConcurrentRun>
 
@@ -31,7 +33,6 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QProcess>
-#include <QProxyStyle>
 #include <QRandomGenerator>
 #include <QScreen>
 #include <QScrollBar>
@@ -47,12 +48,15 @@
 #include <numbers>
 
 /// The inline text editor: a multiline editor whose native caret is hidden (the
-/// editor paints a shorter one over Neucha's tall line box) and whose caret
-/// rectangle is exposed for that.
+/// editor paints a shorter one over the active font's line box) and whose caret
+/// rectangle is exposed for that. The caret is hidden through cursorWidth
+/// because QPlainTextEdit never consults PM_TextCursorWidth, so a proxy style
+/// zeroing that metric leaves the widget's own caret showing under the
+/// painted one.
 class InlineTextEdit final : public QPlainTextEdit {
 public:
   explicit InlineTextEdit(QWidget *parent) : QPlainTextEdit(parent) {
-    setStyle(&caretlessStyle_);
+    setCursorWidth(0);
     setFrameShape(QFrame::NoFrame);
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -61,27 +65,72 @@ public:
   }
   using QPlainTextEdit::cursorRect;
   using QPlainTextEdit::setViewportMargins;
-
-private:
-  class CaretlessStyle final : public QProxyStyle {
-  public:
-    int pixelMetric(PixelMetric metric, const QStyleOption *option,
-                    const QWidget *widget) const override {
-      return metric == PM_TextCursorWidth
-                 ? 0
-                 : QProxyStyle::pixelMetric(metric, option, widget);
-    }
-  };
-  CaretlessStyle caretlessStyle_;
 };
 
 namespace {
 constexpr std::array<qreal, 3> kTextSizes{2.0, 5.0, 9.0};
 constexpr std::array<const char *, 3> kTextSizeNames{"S", "M", "L"};
 constexpr qreal kToolbarWidth = 840;
-constexpr qreal kToolbarImageGap = 46;
+// Toolbar row to the top of the image below it.
+constexpr qreal kToolbarImageGap = 18.0;
+// Tab strip's bottom edge to the toolbar row above it.
+constexpr qreal kTabToolbarGap = 8.0;
+/// Extra spacing between toolbar groups (history / style / tools / actions),
+/// so the row reads as clusters rather than one flat strip. Ordinary gaps are
+/// tightened from 4px to 2.5px; across the 20 gaps that exactly pays for these
+/// three 10px additions, keeping the existing 840px toolbar envelope and,
+/// crucially, the canvas fit geometry derived from its scale.
+constexpr qreal kToolbarGroupGap = 10;
 constexpr qreal kMinimumRedactionExtent = 5.0;
 constexpr int kBackdropDim = 143;
+
+qreal highlighterPreviewHeight(qreal annotationSize) {
+  return std::max<qreal>(6.0, annotationSize * 3.0);
+}
+
+QRectF highlighterIBeamBounds(const QPointF &center, qreal height,
+                              qreal scale) {
+  const qreal safeScale = std::max<qreal>(scale, 0.01);
+  const qreal serifHalfWidth =
+      std::clamp(height * 0.18, 5.0 / safeScale, 9.0 / safeScale);
+  return {center.x() - serifHalfWidth, center.y() - height / 2.0,
+          serifHalfWidth * 2.0, height};
+}
+
+void paintHighlighterIBeam(QPainter &painter, const QPointF &center,
+                           qreal height, qreal scale) {
+  const qreal safeScale = std::max<qreal>(scale, 0.01);
+  const QRectF bounds = highlighterIBeamBounds(center, height, safeScale);
+  const qreal spineHalfWidth = 1.5 / safeScale;
+  const qreal serifHeight = std::min(
+      height / 2.0,
+      std::clamp(height * 0.08, 2.0 / safeScale, 4.0 / safeScale));
+  const qreal innerTop = bounds.top() + serifHeight;
+  const qreal innerBottom = bounds.bottom() - serifHeight;
+
+  QPainterPath beam;
+  beam.moveTo(bounds.topLeft());
+  beam.lineTo(bounds.topRight());
+  beam.lineTo(bounds.right(), innerTop);
+  beam.lineTo(center.x() + spineHalfWidth, innerTop);
+  beam.lineTo(center.x() + spineHalfWidth, innerBottom);
+  beam.lineTo(bounds.right(), innerBottom);
+  beam.lineTo(bounds.bottomRight());
+  beam.lineTo(bounds.bottomLeft());
+  beam.lineTo(bounds.left(), innerBottom);
+  beam.lineTo(center.x() - spineHalfWidth, innerBottom);
+  beam.lineTo(center.x() - spineHalfWidth, innerTop);
+  beam.lineTo(bounds.left(), innerTop);
+  beam.closeSubpath();
+
+  painter.save();
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  painter.setBrush(QColor(255, 255, 255, 242));
+  painter.setPen(QPen(QColor(0, 0, 0, 217), 1.6 / safeScale,
+                      Qt::SolidLine, Qt::SquareCap, Qt::MiterJoin));
+  painter.drawPath(beam);
+  painter.restore();
+}
 
 /// Beside the snapshots and the instance lock, in the private runtime dir.
 /// Session scratch, not configuration: gone at reboot, and a region only
@@ -256,13 +305,15 @@ quint32 freshRedactionSeed() {
 
 /// Offset for a duplicated layer: down-left by default, flipped per axis
 /// when that would push the copy off the canvas and the other way fits.
-QPointF duplicateOffset(const QRectF &bounds, const QSizeF &canvas) {
+QPointF duplicateOffset(const QRectF &bounds, const QRectF &canvas) {
   constexpr qreal step = 100.0;
   qreal dx = -step;
   qreal dy = step;
-  if (bounds.left() + dx < 0 && bounds.right() - dx <= canvas.width())
+  if (bounds.left() + dx < canvas.left() &&
+      bounds.right() - dx <= canvas.right())
     dx = -dx;
-  if (bounds.bottom() + dy > canvas.height() && bounds.top() - dy >= 0)
+  if (bounds.bottom() + dy > canvas.bottom() &&
+      bounds.top() - dy >= canvas.top())
     dy = -dy;
   return {dx, dy};
 }
@@ -378,9 +429,40 @@ QString cornerName(qreal radius) {
                       : QStringLiteral("square corners");
 }
 
+TextBackground nextTextBackground(TextBackground background) {
+  switch (background) {
+  case TextBackground::Pill:
+    return TextBackground::Outline;
+  case TextBackground::Outline:
+    return TextBackground::Plain;
+  case TextBackground::Plain:
+    return TextBackground::Pill;
+  }
+  return TextBackground::Pill;
+}
+
 QString textBackgroundName(TextBackground background) {
-  return background == TextBackground::Pill ? QStringLiteral("Pill")
-                                            : QStringLiteral("Plain");
+  switch (background) {
+  case TextBackground::Pill:
+    return QStringLiteral("Pill");
+  case TextBackground::Outline:
+    return QStringLiteral("Outline");
+  case TextBackground::Plain:
+    return QStringLiteral("Plain");
+  }
+  return QStringLiteral("Pill");
+}
+
+TextFont nextTextFont(TextFont textFont) {
+  switch (textFont) {
+  case TextFont::Neucha:
+    return TextFont::JetBrainsMono;
+  case TextFont::JetBrainsMono:
+    return TextFont::InterDisplay;
+  case TextFont::InterDisplay:
+    return TextFont::Neucha;
+  }
+  return TextFont::Neucha;
 }
 
 QString redactionStyleName(RedactionStyle style) {
@@ -487,6 +569,10 @@ QString backgroundName(BackgroundStyle style) {
   switch (style) {
   case BackgroundStyle::None:
     return QStringLiteral("None");
+  case BackgroundStyle::Off:
+    return QStringLiteral("Off");
+  case BackgroundStyle::Slate:
+    return QStringLiteral("Window gray");
   case BackgroundStyle::Aurora:
     return QStringLiteral("Aurora");
   case BackgroundStyle::Sunset:
@@ -495,6 +581,20 @@ QString backgroundName(BackgroundStyle style) {
     return QStringLiteral("Lagoon");
   case BackgroundStyle::Violet:
     return QStringLiteral("Violet");
+  case BackgroundStyle::Custom:
+    return QStringLiteral("Custom");
+  }
+  return {};
+}
+
+QString canvasBoundaryName(CanvasBoundaryMode mode) {
+  switch (mode) {
+  case CanvasBoundaryMode::Framed:
+    return QStringLiteral("Framed");
+  case CanvasBoundaryMode::Overflow:
+    return QStringLiteral("Overflow");
+  case CanvasBoundaryMode::Image:
+    return QStringLiteral("Image");
   }
   return {};
 }
@@ -537,15 +637,39 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
                              QWidget *parent)
     : QWidget(parent), capture_(std::move(capture)),
       quickOutputMode_(quickOutput) {
+  startupTimingMark("CaptureEditor constructor entered");
   pristineSource_ = capture_.source;
   pristineLogicalSize_ = capture_.previewSize;
   paletteConfig_ = loadPaletteConfig(defaultConfigPath());
+  startupTimingMark("palette config loaded");
   customColor_ = paletteConfig_.custom;
+  backgroundConfig_ = loadBackgroundConfig(defaultConfigPath());
+  connect(&backdropWatcher_, &QFutureWatcher<QImage>::finished, this,
+          [this] { completeBackdropLoad(); });
+  if (!backgroundConfig_.imagePath.isEmpty()) {
+    const QString backdropPath = backgroundConfig_.imagePath;
+    backdropWatcher_.setFuture(QtConcurrent::run([backdropPath] {
+      QImage image;
+      image.load(backdropPath);
+      return image;
+    }));
+  }
   if (!log.ops.isEmpty()) {
     ops_ = std::move(log.ops);
     opIndex_ = std::clamp(log.index, 0, static_cast<int>(ops_.size()));
     nextAnnotationId_ = std::max<quint64>(log.nextId, 1);
     nextMarker_ = std::max(log.nextMarker, 1);
+  } else {
+    // A genuinely fresh capture seeds its configured backdrop as the first
+    // undoable operation. Arbitrary custom images load on the worker pool;
+    // built-in styles are available immediately.
+    const BackgroundStyle defaultStyle = backgroundConfig_.defaultStyle;
+    if (defaultStyle == BackgroundStyle::Custom) {
+      configuredCustomDefaultPending_ =
+          !backgroundConfig_.imagePath.isEmpty();
+    } else {
+      seedConfiguredBackground(defaultStyle);
+    }
   }
   setWindowTitle(QStringLiteral("Omasnap"));
   setWindowFlags(Qt::Window | Qt::FramelessWindowHint |
@@ -564,24 +688,14 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
     setGeometry(QGuiApplication::primaryScreen()->geometry());
   cursor_ = mapFromGlobal(QCursor::pos());
 
-  textEditor_ = new InlineTextEdit(this);
-  textEditor_->hide();
-  textEditor_->setViewportMargins(0, 0, 0, 0);
-  textEditor_->setStyleSheet(
-      QStringLiteral("QPlainTextEdit { color: #ff375f; background: transparent; "
-                     "border: none; padding: 0;"
-                     " selection-background-color: #0a84ff; }"));
-  textEditor_->installEventFilter(this);
-  // The editor paints its own, shorter caret (see paintEdit); blink it.
+  // Constructing QPlainTextEdit initializes substantial style/layout state.
+  // Keep it off the launch path; beginText() creates it on first use.
   textCaretTimer_.setInterval(530);
   connect(&textCaretTimer_, &QTimer::timeout, this, [this] {
+    if (!textEditor_)
+      return;
     textCaretOn_ = !textCaretOn_;
     update(textEditor_->geometry().adjusted(-4, -4, 4, 4));
-  });
-  connect(textEditor_, &QPlainTextEdit::cursorPositionChanged, this, [this] {
-    textCaretOn_ = true;
-    textCaretTimer_.start();
-    update();
   });
   // A run of nudges persists once, shortly after the last key, instead of
   // re-rendering the snapshot on every auto-repeat.
@@ -589,35 +703,6 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
   nudgePersistTimer_.setInterval(kNudgeCoalesceMs);
   connect(&nudgePersistTimer_, &QTimer::timeout, this,
           [this] { endNudgeRun(); });
-  connect(textEditor_, &QPlainTextEdit::textChanged, this, [this] {
-        const QString text = textEditor_->toPlainText();
-        const QFontMetrics metrics(textEditor_->font());
-        int widestLine = 0;
-        const QStringList lines = text.split('\n');
-        for (const QString &line : lines)
-          widestLine = std::max(widestLine,
-                                metrics.horizontalAdvance(line + QStringLiteral("  ")));
-        const int sidePadding = textEditPill_
-                                    ? qRound(std::max(4.0, metrics.height() * 0.18))
-                                    : 0;
-        const int desiredWidth = std::max(48, widestLine + sidePadding * 2);
-        const int availableWidth =
-            std::max(48, qRound(editImageRect().right() - textEditor_->x()));
-        // QPlainTextEdit needs a little more than QFontMetrics::height(): its
-        // block layout keeps leading/descent outside the nominal line box.
-        // Without that room the first Return scrolls the original line out of
-        // the viewport, making it look as though the text was erased.
-        const int lineCount = std::max(1, static_cast<int>(lines.size()));
-        const int desiredHeight = lineCount * metrics.lineSpacing() +
-                                  metrics.descent() + 4;
-        textEditor_->resize(std::min(desiredWidth, availableWidth),
-                            desiredHeight);
-        textEditor_->verticalScrollBar()->setValue(0);
-        QTimer::singleShot(0, textEditor_, [editor = textEditor_] {
-          editor->verticalScrollBar()->setValue(0);
-        });
-        update();
-      });
 
   ocrAnimTimer_.setInterval(16);
   connect(&ocrAnimTimer_, &QTimer::timeout, this, [this] { update(); });
@@ -688,6 +773,9 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
   connect(&finishWatcher_, &QFutureWatcher<FinishResult>::finished, this,
           [this] { completeFinish(finishWatcher_.result()); });
 
+  connect(&reopenWatcher_, &QFutureWatcher<ReopenResult>::finished, this,
+          [this] { completeReopenRecent(reopenWatcher_.result()); });
+
   connect(&snapshotWatcher_, &QFutureWatcher<bool>::finished, this, [this] {
     snapshotBusy_ = false;
     snapshotWriteOk_ = snapshotWatcher_.result();
@@ -719,7 +807,7 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
             case CaptureMode::Fullscreen:
               selection_ = QRectF(QPointF(), capture_.previewSize);
               editedKind_ = SelectTab::Fullscreen;
-              enterEdit(QStringLiteral(
+              enterSelectedCapture(QStringLiteral(
                   "Full screen selected · native resolution · outer handles "
                   "crop"));
               break;
@@ -747,21 +835,20 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
             emit captureReady(true, {});
           });
 
-  connect(&pinWatcher_, &QFutureWatcher<QImage>::finished, this, [this] {
+  connect(&pinWatcher_, &QFutureWatcher<PinResult>::finished, this, [this] {
     pinPending_ = false;
-    const QString path = pendingPinPath_;
-    const QImage image = pinWatcher_.result();
-    QString error;
-    if (image.isNull() || !saveTemporarySnapshot(image, path, error)) {
+    const PinResult result = pinWatcher_.result();
+    if (result.path.isEmpty()) {
       --pinCount_;
-      setStatus(error.isEmpty()
+      setStatus(result.error.isEmpty()
                     ? QStringLiteral("Could not render pinned capture")
-                    : error);
+                    : result.error);
       return;
     }
     if (!QProcess::startDetached(QCoreApplication::applicationFilePath(),
-                                 {QStringLiteral("--pin"), path})) {
-      QFile::remove(path);
+                                 {QStringLiteral("--pin"), result.path})) {
+      QFile::remove(result.path);
+      QFile::remove(operationLogPath(result.path));
       --pinCount_;
       setStatus(QStringLiteral("Could not start pinned capture"));
       return;
@@ -789,7 +876,7 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
     const bool veryLong =
         capture_.previewSize.width() > stitch::kWidelyOpenableEdge ||
         capture_.previewSize.height() > stitch::kWidelyOpenableEdge;
-    enterEdit(
+    const QString editStatus =
         veryLong
             ? QStringLiteral("Very long capture (%1 × %2) · edits and saves "
                              "here as usual, but many apps cannot open images "
@@ -799,12 +886,16 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
         : mode == CaptureMode::File
             ? QStringLiteral("Editing image from file · Copy/Save to output")
             : QStringLiteral("Full screen selected · native resolution · "
-                             "outer handles crop"));
+                             "outer handles crop");
+    if (mode == CaptureMode::File)
+      enterEdit(editStatus);
+    else
+      enterSelectedCapture(editStatus);
   } else if (mode == CaptureMode::Window) {
     windowMode_ = true;
     hoveredWindow_ = windowAt(cursor_);
     setStatus(QStringLiteral("Window mode · click or Super+Arrows then Enter · "
-                             "Space returns to area"));
+                             "Space selects a scrolling region"));
   } else if (mode == CaptureMode::Scroll) {
     scrollMode_ = true;
     setStatus(QStringLiteral(
@@ -837,8 +928,11 @@ CaptureEditor::CaptureEditor(CaptureData capture, CaptureMode mode,
           });
   // The shelf belongs to the select overlay only: a file being edited has no
   // select phase, and quick output never shows one long enough to use it.
-  if (mode != CaptureMode::File && quickOutputMode_ == QuickOutputMode::None)
+  if (mode != CaptureMode::File && quickOutputMode_ == QuickOutputMode::None) {
+    startupTimingMark("recent shelf load dispatch starting");
     loadRecents();
+    startupTimingMark("recent shelf load dispatched");
+  }
   updatePointerCursor();
 }
 
@@ -890,7 +984,7 @@ bool CaptureEditor::eventFilter(QObject *watched, QEvent *event) {
     }
   } else if (watched == textEditor_ && event->type() == QEvent::FocusOut) {
     QTimer::singleShot(0, this, [this] {
-      if (textEditor_->isVisible() && !textEditor_->hasFocus())
+      if (textEditing() && !textEditor_->hasFocus())
         acceptText();
     });
   }
@@ -927,28 +1021,6 @@ QRectF CaptureEditor::annotationBounds(const Annotation &annotation) const {
   }
   return QRectF(annotation.start, annotation.end).normalized();
 }
-QRectF CaptureEditor::selectedAnnotationsBounds() const {
-  QRectF bounds;
-  bool initialized = false;
-  for (const int index : selectedAnnotations_) {
-    if (index < 0 || index >= annotations_.size())
-      continue;
-    QRectF annotation = annotationBounds(annotations_.at(index));
-    if (annotation.isNull())
-      continue;
-    // A horizontal arrow or line has zero height, which isEmpty() reports as
-    // nothing at all; give it an extent so the group still covers it.
-    annotation = annotation.normalized();
-    if (annotation.width() <= 0.0)
-      annotation.setWidth(1.0);
-    if (annotation.height() <= 0.0)
-      annotation.setHeight(1.0);
-    bounds = initialized ? bounds.united(annotation) : annotation;
-    initialized = true;
-  }
-  return initialized ? bounds : QRectF();
-}
-
 void CaptureEditor::selectAllAnnotations() {
   if (annotations_.isEmpty()) {
     setStatus(QStringLiteral("No layers to select"));
@@ -1165,12 +1237,47 @@ void CaptureEditor::applyBoxResize(Annotation &annotation, Interaction handle,
   annotation.end = box.bottomRight();
 }
 
+QString CaptureEditor::highlighterStatus() const {
+  if (highlighterMode_ == HighlighterMode::Snap) {
+    return QStringLiteral("Highlighter · Snap · text height automatic · wheel "
+                          "sets off-text size %1 · H toggles Normal")
+        .arg(qRound(annotationSize_));
+  }
+  return QStringLiteral("Highlighter · Normal · freehand size %1 · wheel / "
+                        "Alt+wheel resizes · H toggles Snap")
+      .arg(qRound(annotationSize_));
+}
+
+QString CaptureEditor::highlighterTooltip() const {
+  if (highlighterMode_ == HighlighterMode::Snap) {
+    return QStringLiteral("Highlighter · Snap · text height automatic · wheel "
+                          "sets off-text size %1 · H / click again: Normal")
+        .arg(qRound(annotationSize_));
+  }
+  return QStringLiteral("Highlighter · Normal · freehand · size %1 · wheel / "
+                        "Alt+wheel · H / click again: Snap")
+      .arg(qRound(annotationSize_));
+}
+
+void CaptureEditor::activateHighlighter() {
+  if (tool_ == Tool::Highlighter) {
+    highlighterMode_ = highlighterMode_ == HighlighterMode::Snap
+                           ? HighlighterMode::Normal
+                           : HighlighterMode::Snap;
+  } else {
+    tool_ = Tool::Highlighter;
+  }
+  highlighterLock_.reset();
+  highlighterPreview_.reset();
+  setStatus(highlighterStatus());
+}
+
 QString CaptureEditor::toolStatus() const {
   const int size = qRound(annotationSize_);
   switch (tool_) {
   case Tool::Select:
-    return QStringLiteral("Select · drag moves layers · wheel zooms · outer "
-                          "handles crop");
+    return QStringLiteral("Select · drag moves layers · Ctrl+wheel zooms · "
+                          "outer handles crop");
   case Tool::Spotlight: {
     const QString shape =
         spotlightShape_ == SpotlightShape::Ellipse ? QStringLiteral("ellipse")
@@ -1193,7 +1300,9 @@ QString CaptureEditor::toolStatus() const {
     return QStringLiteral("Redact · %1 · D toggles style")
         .arg(redactionStyleName(redactionStyle_).toLower());
   case Tool::Text:
-    return QStringLiteral("Text · size %1 · click to type")
+    return QStringLiteral("Text · %1 · size %2 · Shift+T cycles font · click "
+                          "to type")
+        .arg(annotationTextFontName(textFont_))
         .arg(QString::fromLatin1(
             kTextSizeNames.at(static_cast<std::size_t>(textSizeIndex_))));
   case Tool::Marker:
@@ -1215,10 +1324,11 @@ QString CaptureEditor::toolStatus() const {
         .arg(size);
   case Tool::Cut:
     return QStringLiteral("Cut · drag a band to remove it");
+  case Tool::Highlighter:
+    return highlighterStatus();
   case Tool::Arrow:
   case Tool::Line:
   case Tool::Freehand:
-  case Tool::Highlighter:
     break;
   }
   const QString name = tool_ == Tool::Arrow      ? QStringLiteral("Arrow")
@@ -1390,14 +1500,14 @@ int CaptureEditor::hoveredSpotlightAt(const QPointF &position) const {
   return index;
 }
 void CaptureEditor::duplicateSelectedAnnotation() {
-  if (dragging_ || textEditor_->isVisible() || selectedAnnotation_ < 0 ||
+  if (dragging_ || textEditing() || selectedAnnotation_ < 0 ||
       selectedAnnotation_ >= annotations_.size())
     return;
   endNudgeRun();
   Annotation copy = annotations_.at(selectedAnnotation_);
   copy.id = 0;
   translateAnnotation(
-      copy, duplicateOffset(annotationBounds(copy), selection_.size()));
+      copy, duplicateOffset(annotationBounds(copy), canvasRect_));
   if (copy.kind == Annotation::Kind::Marker)
     copy.number = nextMarker_;
   if (copy.kind == Annotation::Kind::Redaction) {
@@ -1420,6 +1530,17 @@ bool CaptureEditor::adjustSelectedAnnotationRing(int step) {
   if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size())
     return false;
   Annotation &annotation = annotations_[selectedAnnotation_];
+  if (annotation.kind == Annotation::Kind::Rectangle) {
+    // The selected rectangle's own corners, undoably; the armed tool's
+    // default radius stays what it was.
+    annotation.cornerRadius =
+        std::clamp(annotation.cornerRadius + step * kCornerRadiusStep, 0.0,
+                   kMaximumCornerRadius);
+    setStatus(QStringLiteral("Rectangle · %1 · Alt+wheel adjusts")
+                  .arg(cornerName(annotation.cornerRadius)));
+    commitPatch({selectedAnnotation_});
+    return true;
+  }
   if (annotation.kind != Annotation::Kind::Spotlight)
     return false;
   annotation.size = std::clamp(annotation.size + step * 2.0, 0.0, 12.0);
@@ -1547,20 +1668,33 @@ void CaptureEditor::toggleTextBackground() {
   if (selectedAnnotation_ >= 0 && selectedAnnotation_ < annotations_.size() &&
       annotations_.at(selectedAnnotation_).kind == Annotation::Kind::Text) {
     Annotation &text = annotations_[selectedAnnotation_];
-    text.textBackground = text.textBackground == TextBackground::Pill
-                              ? TextBackground::Plain
-                              : TextBackground::Pill;
-    setStatus(QStringLiteral("Selected text: %1 · T again toggles")
+    text.textBackground = nextTextBackground(text.textBackground);
+    setStatus(QStringLiteral("Selected text: %1 · T again cycles")
                   .arg(textBackgroundName(text.textBackground).toLower()));
     commitPatch({selectedAnnotation_});
     return;
   }
-  textBackground_ = textBackground_ == TextBackground::Pill
-                        ? TextBackground::Plain
-                        : TextBackground::Pill;
+  textBackground_ = nextTextBackground(textBackground_);
   selectedAnnotation_ = -1;
-  setStatus(QStringLiteral("Text: %1 · T again toggles")
+  setStatus(QStringLiteral("Text: %1 · T again cycles")
                 .arg(textBackgroundName(textBackground_).toLower()));
+}
+
+void CaptureEditor::cycleTextFont() {
+  if (selectedAnnotation_ >= 0 && selectedAnnotation_ < annotations_.size() &&
+      annotations_.at(selectedAnnotation_).kind == Annotation::Kind::Text) {
+    Annotation &text = annotations_[selectedAnnotation_];
+    text.textFont = nextTextFont(text.textFont);
+    setStatus(QStringLiteral("Selected text: %1 · Shift+T cycles font")
+                  .arg(annotationTextFontName(text.textFont)));
+    commitPatch({selectedAnnotation_});
+    return;
+  }
+  textFont_ = nextTextFont(textFont_);
+  selectedAnnotation_ = -1;
+  tool_ = Tool::Text;
+  setStatus(QStringLiteral("Text: %1 · Shift+T cycles font")
+                .arg(annotationTextFontName(textFont_)));
 }
 
 QPointF CaptureEditor::constrainedResizeEndpoint(
@@ -1589,6 +1723,10 @@ void CaptureEditor::nudgeSelectedAnnotation(const QPointF &delta) {
     endNudgeRun();
   nudgeTimer_.restart();
   translateAnnotation(annotations_[selectedAnnotation_], delta);
+  // Keyboard geometry has no pointer-to-canvas feedback loop, so refit it
+  // immediately. The coalescing timer still keeps the whole key run in one
+  // undo/snapshot operation.
+  refreshCanvasRect();
   setStatus(QStringLiteral("Nudged · arrows move 1 px · Shift 10 px"));
   nudgePersistTimer_.start();
 }
@@ -1604,14 +1742,7 @@ void CaptureEditor::endNudgeRun() {
 }
 
 QRectF CaptureEditor::colorPaletteRect() const {
-  const qreal scale = toolbarScale(width());
-  const qreal toolbarWidth = kToolbarWidth * scale;
-  const qreal buttonHeight = 36 * scale;
-  const qreal toolbarX = (width() - toolbarWidth) / 2.0;
-  const qreal toolbarY =
-      std::max<qreal>(10, chromeAnchorTop() - buttonHeight - kToolbarImageGap);
-  const QRectF anchor(toolbarX + 440 * scale, toolbarY, 36 * scale,
-                      buttonHeight);
+  const QRectF anchor = toolbarButtonRect(QStringLiteral("palette"));
   const qreal paletteWidth =
       8.0 + (static_cast<qreal>(paletteConfig_.palette.size()) + 2.0) * 28.0;
   const qreal x = std::clamp(anchor.center().x() - paletteWidth / 2.0, 8.0,
@@ -1630,25 +1761,14 @@ QRectF CaptureEditor::customColorPanelRect() const {
 }
 
 QRectF CaptureEditor::shapeMenuRect() const {
-  const qreal scale = toolbarScale(width());
-  const qreal toolbarX = (width() - kToolbarWidth * scale) / 2.0;
-  const qreal buttonHeight = 36 * scale;
-  const qreal toolbarY =
-      std::max<qreal>(10, chromeAnchorTop() - buttonHeight - kToolbarImageGap);
-  const QRectF anchor(toolbarX + 240 * scale, toolbarY, buttonHeight,
-                      buttonHeight);
+  QRectF anchor = toolbarButtonRect(QStringLiteral("tool-rectangle"));
+  if (anchor.isEmpty())
+    anchor = toolbarButtonRect(QStringLiteral("tool-ellipse"));
   return {anchor.center().x() - 58, anchor.bottom() + 4, 116, 36};
 }
 
 QRectF CaptureEditor::textSizePanelRect() const {
-  const qreal scale = toolbarScale(width());
-  const qreal toolbarWidth = kToolbarWidth * scale;
-  const qreal buttonHeight = 36 * scale;
-  const qreal toolbarX = (width() - toolbarWidth) / 2.0;
-  const qreal toolbarY =
-      std::max<qreal>(10, chromeAnchorTop() - buttonHeight - kToolbarImageGap);
-  const QRectF anchor(toolbarX + 400 * scale, toolbarY, 36 * scale,
-                      buttonHeight);
+  const QRectF anchor = toolbarButtonRect(QStringLiteral("tool-text"));
   return {anchor.center().x() - 51, anchor.bottom() + 6, 102, 34};
 }
 
@@ -1691,30 +1811,44 @@ QRectF CaptureEditor::normalizedSelection(const QPointF &first,
   return QRectF(a, b).normalized();
 }
 
-QRectF CaptureEditor::baseImageRect() const {
-  if (selection_.isEmpty())
-    return {};
-  const QRectF available(30, 68, std::max(1, width() - 60),
-                         std::max(1, height() - 126));
-  const qreal scale =
-      std::min<qreal>({1.0, available.width() / selection_.width(),
-                       available.height() / selection_.height()});
-  const QSizeF shown = selection_.size() * scale;
-  return {available.center().x() - shown.width() / 2.0,
-          available.center().y() - shown.height() / 2.0, shown.width(),
-          shown.height()};
+qreal CaptureEditor::toolbarTop() const {
+  // Just under the tab strip's fixed bottom edge — independent of the image,
+  // so the two can never overlap regardless of window size or image shape.
+  return kCaptureTabBarBottom + kTabToolbarGap;
 }
 
-qreal CaptureEditor::chromeAnchorTop() const {
-  // Zoomed past fit the content fills the viewport band, so anchoring to the
-  // centered fit rect would float the chrome over it. Anchor to the band.
-  const qreal base = baseImageRect().top();
-  return viewZoom_ > 1.0 ? std::min<qreal>(base, 68.0) : base;
+qreal CaptureEditor::imageTopMargin() const {
+  // The toolbar's own height (it scales with width, see toolbarScale) plus
+  // the gap below it: the real, current height of everything stacked above
+  // the image, not a guessed constant. The image shrinks to fit under it on
+  // any window size, small ones included. Rounded to a whole pixel: a
+  // fractional margin puts the image at a fractional offset even at scale 1,
+  // which is needless sub-pixel blur for no visual benefit.
+  return std::round(toolbarTop() + 36.0 * toolbarScale(width()) +
+                    kToolbarImageGap);
+}
+
+QRectF CaptureEditor::baseImageRect() const {
+  if (selection_.isEmpty() || canvasRect_.isEmpty())
+    return {};
+  const qreal top = imageTopMargin();
+  const QRectF available(30, top, std::max(1, width() - 60),
+                         std::max<qreal>(1, height() - top - 58));
+  const qreal scale =
+      std::min<qreal>({1.0, available.width() / canvasRect_.width(),
+                       available.height() / canvasRect_.height()});
+  const QSizeF shown = canvasRect_.size() * scale;
+  // Snapped to the pixel grid: centering can land the origin on a half
+  // pixel, which is needless blur at scale 1 (the common case, an
+  // unscaled or lightly cropped capture) for no visual benefit.
+  return {std::round(available.center().x() - shown.width() / 2.0),
+          std::round(available.center().y() - shown.height() / 2.0),
+          shown.width(), shown.height()};
 }
 
 QRectF CaptureEditor::editImageRect() const {
   const QRectF base = baseImageRect();
-  if (base.isEmpty() || viewZoom_ <= 1.0)
+  if (base.isEmpty() || qFuzzyCompare(viewZoom_, 1.0))
     return base.translated(viewOffset_);
   const QSizeF shown = base.size() * viewZoom_;
   const QPointF center = base.center();
@@ -1726,9 +1860,9 @@ QRectF CaptureEditor::editImageRect() const {
 
 qreal CaptureEditor::maxViewZoom() const {
   const QRectF base = baseImageRect();
-  if (base.isEmpty() || selection_.width() <= 0)
+  if (base.isEmpty() || canvasRect_.width() <= 0)
     return 1.0;
-  const qreal baseScale = base.width() / selection_.width();
+  const qreal baseScale = base.width() / canvasRect_.width();
   return std::max<qreal>(1.0, 4.0 / std::max<qreal>(baseScale, 0.0001));
 }
 
@@ -1754,17 +1888,21 @@ void CaptureEditor::clampViewOffset() {
 }
 
 void CaptureEditor::setViewZoom(qreal zoom, const QPointF &focus) {
-  const qreal clamped = std::clamp(zoom, 1.0, maxViewZoom());
+  // Down to a tenth: an overview of a tall stitch or a large capture is
+  // as legitimate as a closeup.
+  const qreal clamped = std::clamp(zoom, 0.10, maxViewZoom());
   if (qFuzzyCompare(clamped, viewZoom_))
     return;
   const QRectF before = editImageRect();
-  const qreal beforeScale = before.width() > 0 ? before.width() / selection_.width() : 1.0;
+  const qreal beforeScale =
+      before.width() > 0 ? before.width() / canvasRect_.width() : 1.0;
   const QPointF imagePoint((focus.x() - before.left()) / std::max(beforeScale, 1e-6),
                            (focus.y() - before.top()) / std::max(beforeScale, 1e-6));
   viewZoom_ = clamped;
   clampViewOffset();
   const QRectF after = editImageRect();
-  const qreal afterScale = after.width() > 0 ? after.width() / selection_.width() : 1.0;
+  const qreal afterScale =
+      after.width() > 0 ? after.width() / canvasRect_.width() : 1.0;
   const QPointF mappedFocus(after.left() + imagePoint.x() * afterScale,
                             after.top() + imagePoint.y() * afterScale);
   viewOffset_ += focus - mappedFocus;
@@ -1791,7 +1929,7 @@ void CaptureEditor::resetView() {
 }
 
 QVector<QRectF> CaptureEditor::cropHandleRects() const {
-  const QRectF image = editImageRect();
+  const QRectF image = sourceFrameWidgetRect();
   if (image.isEmpty())
     return {};
   constexpr qreal outside = 7;
@@ -1823,25 +1961,41 @@ int CaptureEditor::cropHandleAt(const QPointF &point) const {
 }
 
 qreal CaptureEditor::editScale() const {
-  return selection_.width() > 0 ? editImageRect().width() / selection_.width()
+  return canvasRect_.width() > 0 ? editImageRect().width() / canvasRect_.width()
                                 : 1.0;
+}
+
+QRectF CaptureEditor::sourceFrameWidgetRect() const {
+  const QRectF canvas = editImageRect();
+  if (canvas.isEmpty() || canvasRect_.isEmpty())
+    return {};
+  const qreal scale = std::max<qreal>(editScale(), 0.001);
+  return {canvas.left() - canvasRect_.left() * scale,
+          canvas.top() - canvasRect_.top() * scale,
+          selection_.width() * scale, selection_.height() * scale};
 }
 
 QPointF CaptureEditor::toAnnotationPoint(const QPointF &position) const {
   const QRectF image = editImageRect();
   const qreal scale = std::max<qreal>(editScale(), 0.001);
-  return {std::clamp((position.x() - image.left()) / scale, 0.0,
-                     selection_.width()),
-          std::clamp((position.y() - image.top()) / scale, 0.0,
-                     selection_.height())};
+  return {std::clamp((position.x() - image.left()) / scale + canvasRect_.left(),
+                     canvasRect_.left(), canvasRect_.right()),
+          std::clamp((position.y() - image.top()) / scale + canvasRect_.top(),
+                     canvasRect_.top(), canvasRect_.bottom())};
 }
 
 QPointF
 CaptureEditor::toUnclampedAnnotationPoint(const QPointF &position) const {
   const QRectF image = editImageRect();
   const qreal scale = std::max<qreal>(editScale(), 0.001);
-  return {(position.x() - image.left()) / scale,
-          (position.y() - image.top()) / scale};
+  return {(position.x() - image.left()) / scale + canvasRect_.left(),
+          (position.y() - image.top()) / scale + canvasRect_.top()};
+}
+
+QPointF CaptureEditor::markerPlacementPoint(const QPointF &position) const {
+  constexpr qreal kPointerLead = 9.0;
+  const qreal lead = kPointerLead / std::max<qreal>(editScale(), 0.001);
+  return toAnnotationPoint(position) - QPointF(lead, lead);
 }
 
 bool CaptureEditor::selectedLayerAcceptsPoint(const QPointF &point) const {
@@ -1875,6 +2029,54 @@ QPointF CaptureEditor::sourcePoint(const QPointF &logicalPoint) const {
   return sourceRect(QRectF(logicalPoint, QSizeF())).topLeft();
 }
 
+std::optional<CaptureEditor::HighlighterLock>
+CaptureEditor::highlighterLockAt(const QPointF &annotationPoint) const {
+  if (capture_.source.isNull() || capture_.previewSize.isEmpty() ||
+      !QRectF(QPointF(), selection_.size()).contains(annotationPoint))
+    return std::nullopt;
+
+  const QSizeF sourceScale(
+      capture_.source.width() /
+          static_cast<qreal>(capture_.previewSize.width()),
+      capture_.source.height() /
+          static_cast<qreal>(capture_.previewSize.height()));
+  const QPointF logicalPoint = selection_.topLeft() + annotationPoint;
+  const auto band =
+      detectTextBand(capture_.source, sourcePoint(logicalPoint), sourceScale);
+  if (!band)
+    return std::nullopt;
+
+  // Match the text-band padding used for the committed stroke. Keeping this
+  // in one helper makes the hover I-beam and mouse-down lock identical.
+  constexpr qreal padPerSide = 0.05;
+  const qreal centerY =
+      band->center() / sourceScale.height() - selection_.top();
+  const qreal highlightedHeight =
+      band->height() * (1.0 + 2.0 * padPerSide) / sourceScale.height();
+  return HighlighterLock{std::clamp(centerY, 0.0, selection_.height()),
+                         highlightedHeight / 3.0};
+}
+
+QRectF CaptureEditor::highlighterPreviewRectForTest() const {
+  if (!highlighterPreview_)
+    return {};
+  const qreal height =
+      highlighterPreviewHeight(highlighterPreview_->annotationSize);
+  const QPointF pointer = toAnnotationPoint(cursor_);
+  const QPointF center(pointer.x(), dragging_ && highlighterLock_
+                                        ? highlighterPreview_->centerY
+                                        : pointer.y());
+  return highlighterIBeamBounds(center, height, editScale());
+}
+
+QRectF CaptureEditor::highlighterToolbarRectForTest() const {
+  for (const ToolbarButton &button : toolbarButtons()) {
+    if (button.action == QStringLiteral("tool-highlighter"))
+      return button.rect;
+  }
+  return {};
+}
+
 QRectF CaptureEditor::mapWidgetToPreview(const QRectF &widgetRect) const {
   const QSize widget = size();
   const QSize preview = capture_.previewSize;
@@ -1901,6 +2103,8 @@ QString CaptureEditor::measurementText() const {
   if (capture_.source.isNull())
     return {};
   if (phase_ == Phase::Select) {
+    if (recentsOpen_)
+      return {};
     if (windowMode_) {
       if (hoveredWindow_ < 0 || hoveredWindow_ >= capture_.windows.size())
         return {};
@@ -1968,15 +2172,17 @@ int CaptureEditor::windowInDirection(int current, int key) const {
   return best;
 }
 
-QVector<CaptureEditor::ToolbarButton> CaptureEditor::toolbarButtons() const {
+QVector<CaptureEditor::ToolbarButton>
+CaptureEditor::toolbarButtons(QVector<qreal> *groupDividers,
+                              bool includeSubmenus) const {
   QVector<ToolbarButton> buttons;
   const qreal scale = toolbarScale(width());
   const qreal height = 36 * scale;
-  const qreal gap = 4 * scale;
+  const qreal gap = 2.5 * scale;
+  const qreal groupGap = kToolbarGroupGap * scale;
   const qreal total = kToolbarWidth * scale;
   qreal x = (width() - total) / 2.0;
-  const qreal y =
-      std::max<qreal>(10, chromeAnchorTop() - height - kToolbarImageGap);
+  const qreal y = toolbarTop();
   auto add = [&](qreal buttonWidth, QString action, QString label,
                  QString tooltip, QColor color = {}) {
     const qreal scaledWidth = buttonWidth * scale;
@@ -1984,9 +2190,30 @@ QVector<CaptureEditor::ToolbarButton> CaptureEditor::toolbarButtons() const {
                        std::move(label), std::move(tooltip), color});
     x += scaledWidth + gap;
   };
+  /// Marks the end of a logical cluster: widens the trailing gap and, when
+  /// the caller wants dividers drawn, records the gap's midpoint.
+  auto endGroup = [&]() {
+    if (groupDividers)
+      groupDividers->push_back(x - gap + groupGap / 2.0);
+    x += groupGap;
+  };
 
+  // History: undo/redo together, leading the bar.
+  add(36, QStringLiteral("undo"), {}, QStringLiteral("Undo · Ctrl+Z"));
+  add(36, QStringLiteral("redo"), {},
+      QStringLiteral("Redo · Ctrl+Shift+Z / Ctrl+Y"));
+  endGroup();
+
+  // Style: canvas backdrop and annotation color.
+  add(36, QStringLiteral("background"), {},
+      QStringLiteral("Cycle backdrop · B"));
+  add(36, QStringLiteral("palette"), {}, QStringLiteral("Annotation color"),
+      annotationColor());
+  endGroup();
+
+  // Tools: everything that acts on the image via the cursor.
   add(36, QStringLiteral("tool-select"), {},
-      QStringLiteral("Select/move · V · Wheel zoom · outer handles crop"));
+      QStringLiteral("Select/move · V · Ctrl+wheel zoom · outer handles crop"));
   add(36, QStringLiteral("tool-arrow"), {},
       QStringLiteral("Arrow · A · Shift snaps 45° · Size %1 · Wheel")
           .arg(qRound(annotationSize_)));
@@ -1996,9 +2223,7 @@ QVector<CaptureEditor::ToolbarButton> CaptureEditor::toolbarButtons() const {
   add(36, QStringLiteral("tool-freehand"), {},
       QStringLiteral("Freehand · F · Size %1 · Wheel")
           .arg(qRound(annotationSize_)));
-  add(36, QStringLiteral("tool-highlighter"), {},
-      QStringLiteral("Highlighter · H · Size %1 · Wheel")
-          .arg(qRound(annotationSize_)));
+  add(36, QStringLiteral("tool-highlighter"), {}, highlighterTooltip());
   add(36, QStringLiteral("tool-marker"), {},
       QStringLiteral("Number marker · C · Size %1 · Wheel")
           .arg(qRound(annotationSize_)));
@@ -2022,19 +2247,17 @@ QVector<CaptureEditor::ToolbarButton> CaptureEditor::toolbarButtons() const {
   add(36, QStringLiteral("tool-cut"), {},
       QStringLiteral("Cut out a band · X · drag across"));
   add(36, QStringLiteral("tool-text"), {},
-      QStringLiteral("Neucha text · T · %1 · %2 · T again toggles pill · Wheel")
+      QStringLiteral("%1 text · T · %2 · %3 · T again cycles style · "
+                     "Shift+T cycles font · Wheel")
+          .arg(annotationTextFontName(textFont_))
           .arg(QString::fromLatin1(
               kTextSizeNames.at(static_cast<std::size_t>(textSizeIndex_))))
           .arg(textBackgroundName(textBackground_)));
-  add(36, QStringLiteral("palette"), {}, QStringLiteral("Annotation color"),
-      annotationColor());
   add(36, QStringLiteral("tool-ocr"), {},
       QStringLiteral("Copy all text in the image · O"));
-  add(36, QStringLiteral("background"), {},
-      QStringLiteral("Cycle backdrop · B"));
-  add(36, QStringLiteral("undo"), {}, QStringLiteral("Undo · Ctrl+Z"));
-  add(36, QStringLiteral("redo"), {},
-      QStringLiteral("Redo · Ctrl+Shift+Z / Ctrl+Y"));
+  endGroup();
+
+  // Actions: pin and finish/exit the capture.
   add(36, QStringLiteral("pin"), {},
       QStringLiteral("Pin on screen · P · Ctrl+C on the pin copies it"));
   add(36, QStringLiteral("copy"), {}, QStringLiteral("Copy only · Ctrl+C"));
@@ -2042,7 +2265,7 @@ QVector<CaptureEditor::ToolbarButton> CaptureEditor::toolbarButtons() const {
   add(36, QStringLiteral("save"), {}, QStringLiteral("Save only · Ctrl+S"));
   add(36, QStringLiteral("close"), {}, QStringLiteral("Close · Esc twice"));
 
-  if (shapeMenuOpen_) {
+  if (includeSubmenus && shapeMenuOpen_) {
     const QRectF menu = shapeMenuRect();
     buttons.push_back({{menu.left() + 4, menu.top() + 4, 32, 28},
                        QStringLiteral("shape-rectangle"), {},
@@ -2055,7 +2278,7 @@ QVector<CaptureEditor::ToolbarButton> CaptureEditor::toolbarButtons() const {
                        fillShapes_ ? QStringLiteral("filled") : QString(),
                        QStringLiteral("Toggle filled or outlined shapes"), {}});
   }
-  if (colorPaletteOpen_) {
+  if (includeSubmenus && colorPaletteOpen_) {
     const QRectF palette = colorPaletteRect();
     const int presetCount = static_cast<int>(paletteConfig_.palette.size());
     for (int index = 0; index < presetCount; ++index) {
@@ -2078,20 +2301,61 @@ QVector<CaptureEditor::ToolbarButton> CaptureEditor::toolbarButtons() const {
   return buttons;
 }
 
+QRectF CaptureEditor::toolbarButtonRect(const QString &action) const {
+  for (const ToolbarButton &button : toolbarButtons(nullptr, false)) {
+    if (button.action == action)
+      return button.rect;
+  }
+  return {};
+}
+
 void CaptureEditor::setStatus(QString status) {
   status_ = std::move(status);
   update();
 }
 
 CaptureEditor::EditState CaptureEditor::editState() const {
-  return {annotations_,        backgroundStyle_,     selection_,
-          selectedAnnotation_, selectedAnnotations_, nextMarker_,
-          cuts_};
+  return {annotations_,       backgroundStyle_,     imageShadow_,
+          canvasBoundaryMode_, selection_,           selectedAnnotation_,
+          selectedAnnotations_, nextMarker_,         cuts_};
+}
+
+void CaptureEditor::refreshCanvasRect() {
+  const QRectF next = selection_.isEmpty()
+                          ? QRectF()
+                          : captureCanvasRect(selection_.size(), annotations_,
+                                              canvasBoundaryMode_);
+  if (next == canvasRect_)
+    return;
+  canvasRect_ = next;
+  redactionBaseStale_ = true;
+  viewZoom_ = std::min(viewZoom_, maxViewZoom());
+  clampViewOffset();
+}
+
+bool CaptureEditor::canvasGrown() const {
+  if (selection_.isEmpty() || canvasRect_.isEmpty())
+    return false;
+  const QRectF sourceFrame(QPointF(), selection_.size());
+  return canvasRect_.left() < sourceFrame.left() - 0.001 ||
+         canvasRect_.top() < sourceFrame.top() - 0.001 ||
+         canvasRect_.right() > sourceFrame.right() + 0.001 ||
+         canvasRect_.bottom() > sourceFrame.bottom() + 0.001;
+}
+
+BackgroundStyle CaptureEditor::effectiveBackgroundStyle() const {
+  const bool automaticFramedBackground =
+      canvasBoundaryMode_ == CanvasBoundaryMode::Framed && canvasGrown() &&
+      backgroundStyle_ == BackgroundStyle::None;
+  return automaticFramedBackground ? BackgroundStyle::Slate
+                                   : backgroundStyle_;
 }
 
 void CaptureEditor::applyEditState(const EditState &state) {
   annotations_ = state.annotations;
   backgroundStyle_ = state.backgroundStyle;
+  imageShadow_ = state.imageShadow;
+  canvasBoundaryMode_ = state.canvasBoundary;
   selection_ = state.selection;
   selectedAnnotation_ = std::clamp(state.selectedAnnotation, -1,
                                    static_cast<int>(annotations_.size()) - 1);
@@ -2109,11 +2373,15 @@ void CaptureEditor::applyEditState(const EditState &state) {
     cuts_ = state.cuts;
     refreshComposedCapture();
   }
+  refreshCanvasRect();
   editingAnnotation_ = -1;
   interaction_ = Interaction::None;
   freehandPoints_.clear();
-  textEditor_->clear();
-  textEditor_->hide();
+  highlighterLock_.reset();
+  if (textEditor_) {
+    textEditor_->clear();
+    textEditor_->hide();
+  }
   textCaretTimer_.stop();
   setFocus(Qt::OtherFocusReason);
   updatePointerCursor();
@@ -2131,6 +2399,7 @@ void CaptureEditor::cancelActiveDragForHistory() {
   dragStartStateValid_ = false;
   dragChanged_ = false;
   freehandPoints_.clear();
+  highlighterLock_.reset();
   if (cutDragActive_) {
     cutDragActive_ = false;
     refreshComposedCapture();
@@ -2227,11 +2496,125 @@ void CaptureEditor::commitCut(CutOp cut) {
   commitOp(std::move(op));
 }
 
-void CaptureEditor::commitBackground(BackgroundStyle style) {
+void CaptureEditor::commitBackground(BackgroundStyle style, bool imageShadow) {
   Operation op;
   op.type = Operation::Type::Background;
   op.background = style;
+  op.imageShadow = imageShadow;
   commitOp(std::move(op));
+}
+
+void CaptureEditor::commitCanvasBoundary(CanvasBoundaryMode mode) {
+  Operation op;
+  op.type = Operation::Type::CanvasBoundary;
+  op.canvasBoundary = mode;
+  commitOp(std::move(op));
+}
+
+void CaptureEditor::cycleCanvasBoundary(bool reverse) {
+  CanvasBoundaryMode next = CanvasBoundaryMode::Framed;
+  if (reverse) {
+    switch (canvasBoundaryMode_) {
+    case CanvasBoundaryMode::Framed:
+      next = CanvasBoundaryMode::Image;
+      break;
+    case CanvasBoundaryMode::Overflow:
+      next = CanvasBoundaryMode::Framed;
+      break;
+    case CanvasBoundaryMode::Image:
+      next = CanvasBoundaryMode::Overflow;
+      break;
+    }
+  } else {
+    switch (canvasBoundaryMode_) {
+    case CanvasBoundaryMode::Framed:
+      next = CanvasBoundaryMode::Overflow;
+      break;
+    case CanvasBoundaryMode::Overflow:
+      next = CanvasBoundaryMode::Image;
+      break;
+    case CanvasBoundaryMode::Image:
+      next = CanvasBoundaryMode::Framed;
+      break;
+    }
+  }
+  setStatus(QStringLiteral("Canvas: %1 · G cycles · Shift+G reverses")
+                .arg(canvasBoundaryName(next)));
+  commitCanvasBoundary(next);
+}
+
+void CaptureEditor::cycleBackground() {
+  BackgroundStyle next = BackgroundStyle::None;
+  bool nextShadow = true;
+  switch (backgroundStyle_) {
+  case BackgroundStyle::None:
+  case BackgroundStyle::Off:
+    next = BackgroundStyle::Aurora;
+    break;
+  case BackgroundStyle::Slate:
+    if (imageShadow_) {
+      next = BackgroundStyle::Slate;
+      nextShadow = false;
+    } else {
+      next = BackgroundStyle::Off;
+    }
+    break;
+  case BackgroundStyle::Aurora:
+    next = BackgroundStyle::Sunset;
+    break;
+  case BackgroundStyle::Sunset:
+    next = BackgroundStyle::Lagoon;
+    break;
+  case BackgroundStyle::Lagoon:
+    next = BackgroundStyle::Violet;
+    break;
+  case BackgroundStyle::Violet:
+    next = customBackdrop_.isNull() ? BackgroundStyle::Slate
+                                    : BackgroundStyle::Custom;
+    break;
+  case BackgroundStyle::Custom:
+    next = BackgroundStyle::Slate;
+    break;
+  }
+  if (next == BackgroundStyle::Off) {
+    setStatus(QStringLiteral("Backdrop: Off · B cycles"));
+  } else {
+    setStatus(QStringLiteral("Backdrop: %1 · shadow %2 · B cycles · Shift+B "
+                             "toggles shadow")
+                  .arg(backgroundName(next),
+                       nextShadow ? QStringLiteral("on")
+                                  : QStringLiteral("off")));
+  }
+  commitBackground(next, nextShadow);
+}
+
+void CaptureEditor::seedConfiguredBackground(BackgroundStyle style) {
+  if (style == BackgroundStyle::None)
+    return;
+  Operation op;
+  op.type = Operation::Type::Background;
+  op.background = style;
+  ops_.insert(ops_.cbegin(), std::move(op));
+  ++opIndex_;
+  if (phase_ == Phase::Select)
+    backgroundStyle_ = style;
+  else
+    replayLog();
+}
+
+void CaptureEditor::completeBackdropLoad() {
+  customBackdrop_ = backdropWatcher_.result();
+  if (configuredCustomDefaultPending_) {
+    configuredCustomDefaultPending_ = false;
+    if (!customBackdrop_.isNull())
+      seedConfiguredBackground(BackgroundStyle::Custom);
+  }
+  update();
+  if (pendingSelectedCapture_) {
+    QString status = std::move(*pendingSelectedCapture_);
+    pendingSelectedCapture_.reset();
+    enterSelectedCapture(std::move(status));
+  }
 }
 
 void CaptureEditor::replayLog() {
@@ -2251,17 +2634,33 @@ void CaptureEditor::replayLog() {
                                      : pristineLogicalSize_;
   QRectF selection{QPointF(), QSizeF(startSize)};
   BackgroundStyle background = BackgroundStyle::None;
+  bool imageShadow = true;
+  CanvasBoundaryMode canvasBoundary = CanvasBoundaryMode::Framed;
   QVector<Annotation> annotations;
   QVector<CutOp> cuts;
   int nextMarker = 1;
   for (int index = 0; index < opIndex_ && index < ops_.size(); ++index) {
     const Operation &op = ops_.at(index);
     switch (op.type) {
-    case Operation::Type::Crop:
+    case Operation::Type::Crop: {
+      // Annotation coordinates are relative to the source frame. Preserve
+      // their absolute capture position when a later crop moves that frame,
+      // matching the live crop-handle preview and making undo/reload stable.
+      const QPointF delta = selection.topLeft() - op.crop.topLeft();
+      if (!delta.isNull()) {
+        for (Annotation &annotation : annotations)
+          translateAnnotation(annotation, delta);
+
+      }
       selection = op.crop;
       break;
+    }
     case Operation::Type::Background:
       background = op.background;
+      imageShadow = op.imageShadow;
+      break;
+    case Operation::Type::CanvasBoundary:
+      canvasBoundary = op.canvasBoundary;
       break;
     case Operation::Type::Annotate:
       for (const Annotation &annotation : op.annotations)
@@ -2320,12 +2719,15 @@ void CaptureEditor::replayLog() {
 
   annotations_ = std::move(annotations);
   backgroundStyle_ = background;
+  imageShadow_ = imageShadow;
+  canvasBoundaryMode_ = canvasBoundary;
   if (cuts != cuts_) {
     cuts_ = std::move(cuts);
     refreshComposedCapture();
   }
   if (!selection.isEmpty())
     selection_ = selection;
+  refreshCanvasRect();
   nextMarker = 1;
   for (const Annotation &annotation : annotations_) {
     if (annotation.kind == Annotation::Kind::Marker)
@@ -2410,7 +2812,8 @@ void CaptureEditor::scheduleSnapshot() {
 }
 
 QImage CaptureEditor::renderCurrentOutput() const {
-  return renderCapture(capture_, selection_, annotations_, backgroundStyle_);
+  return renderCapture(capture_, selection_, annotations_, backgroundStyle_,
+                       imageShadow_, canvasBoundaryMode_, customBackdrop_);
 }
 
 void CaptureEditor::startSnapshotRender() {
@@ -2453,6 +2856,15 @@ void CaptureEditor::waitForExport() {
     QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 }
 
+void CaptureEditor::waitForReopen() {
+  while (reopenWatcher_.isRunning()) {
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    QThread::yieldCurrentThread();
+  }
+  for (int pass = 0; pass < 3; ++pass)
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+}
+
 void CaptureEditor::pinSnapshot() {
   if (busy_ || pinPending_ || selection_.isEmpty())
     return;
@@ -2464,16 +2876,31 @@ void CaptureEditor::pinSnapshot() {
     setStatus(QStringLiteral("Could not create private runtime directory"));
     return;
   }
-  pendingPinPath_ = path;
   pinPending_ = true;
   setStatus(QStringLiteral("Preparing pinned capture…"));
   const CaptureData captureCopy = capture_;
   const QVector<Annotation> annotations = annotations_;
   const QRectF selection = selection_;
   const BackgroundStyle background = backgroundStyle_;
+  const bool imageShadow = imageShadow_;
+  const CanvasBoundaryMode canvasBoundary = canvasBoundaryMode_;
+  const QImage backdrop = customBackdrop_;
   pinWatcher_.setFuture(QtConcurrent::run(
-      [captureCopy, annotations, selection, background] {
-        return renderCapture(captureCopy, selection, annotations, background);
+      [captureCopy, annotations, selection, background, imageShadow,
+       canvasBoundary, backdrop, path] {
+        PinResult result;
+        const QImage image =
+            renderCapture(captureCopy, selection, annotations, background,
+                          imageShadow, canvasBoundary, backdrop);
+        if (image.isNull() ||
+            !savePinnedSnapshot(image, path, selection.size().toSize(),
+                                result.error)) {
+          if (result.error.isEmpty())
+            result.error = QStringLiteral("Could not render pinned capture");
+          return result;
+        }
+        result.path = path;
+        return result;
       }));
 }
 
@@ -2496,24 +2923,52 @@ void CaptureEditor::startCapture(CaptureMode mode, bool includeWindows) {
 void CaptureEditor::enterEdit(QString status) {
   phase_ = Phase::Edit;
   tool_ = Tool::Select;
+  refreshCanvasRect();
   viewZoom_ = 1.0;
   viewOffset_ = {};
   setStatus(std::move(status));
   updatePointerCursor();
-  if (quickOutputMode_ != QuickOutputMode::None) {
-    const OutputMode output = quickOutputMode_ == QuickOutputMode::Copy
-                                  ? OutputMode::Copy
-                                  : quickOutputMode_ == QuickOutputMode::Save
-                                        ? OutputMode::Save
-                                        : OutputMode::Both;
-    finish(output);
-    return;
-  }
   const QRectF full(QPointF(), capture_.previewSize);
-  if (ops_.isEmpty() && !selection_.isEmpty() && selection_ != full)
+  const bool hasCrop = std::any_of(
+      ops_.cbegin(),
+      ops_.cbegin() + std::min(opIndex_, static_cast<int>(ops_.size())),
+      [](const Operation &op) { return op.type == Operation::Type::Crop; });
+  if (!hasCrop && !selection_.isEmpty() && selection_ != full)
     commitCrop(selection_);
   else
     scheduleSnapshot();
+}
+
+void CaptureEditor::enterSelectedCapture(QString editStatus) {
+  if (quickOutputMode_ != QuickOutputMode::None) {
+    if (configuredCustomDefaultPending_) {
+      pendingSelectedCapture_ = std::move(editStatus);
+      setStatus(QStringLiteral("Loading custom backdrop…"));
+      return;
+    }
+    enterExport();
+    return;
+  }
+  enterEdit(std::move(editStatus));
+}
+
+void CaptureEditor::enterExport() {
+  if (selection_.isEmpty()) {
+    phase_ = Phase::Select;
+    setStatus(QStringLiteral("Could not output an empty selection"));
+    updatePointerCursor();
+    return;
+  }
+  phase_ = Phase::Export;
+  dragging_ = false;
+  windowMode_ = false;
+  updatePointerCursor();
+  const OutputMode output = quickOutputMode_ == QuickOutputMode::Copy
+                                ? OutputMode::Copy
+                            : quickOutputMode_ == QuickOutputMode::Save
+                                ? OutputMode::Save
+                                : OutputMode::Both;
+  finish(output);
 }
 
 void CaptureEditor::handleEscape() {
@@ -2539,7 +2994,7 @@ void CaptureEditor::handleEscape() {
     selection_ = {};
     setStatus(windowMode_
                   ? QStringLiteral("Window mode · click or Super+Arrows then "
-                                   "Enter · Space returns to area")
+                                   "Enter · Space selects a scrolling region")
                   : QStringLiteral(
                         "Drag to select an area · Space selects a window"));
     updatePointerCursor();
@@ -2553,8 +3008,10 @@ void CaptureEditor::handleEscape() {
     return;
   }
   escapeTimer_.restart();
-  textEditor_->clear();
-  textEditor_->hide();
+  if (textEditor_) {
+    textEditor_->clear();
+    textEditor_->hide();
+  }
   textCaretTimer_.stop();
   editingAnnotation_ = -1;
   if (dragStartStateValid_) {
@@ -2571,6 +3028,7 @@ void CaptureEditor::handleEscape() {
   colorPaletteOpen_ = false;
   customColorPickerOpen_ = false;
   freehandPoints_.clear();
+  highlighterLock_.reset();
   tool_ = Tool::Select;
   setStatus(QStringLiteral("Select/move · Esc again to close"));
   setFocus(Qt::OtherFocusReason);
@@ -2585,22 +3043,70 @@ void CaptureEditor::chooseWindow(int index) {
   redactionBaseStale_ = true;
   windowMode_ = false;
   editedKind_ = SelectTab::Window;
-  enterEdit(QStringLiteral(
-      "Window selected · Select moves layers · wheel zooms · outer handles "
+  enterSelectedCapture(QStringLiteral(
+      "Window selected · Select moves layers · Ctrl+wheel zooms · outer handles "
       "crop"));
+}
+
+void CaptureEditor::ensureTextEditor() {
+  if (textEditor_)
+    return;
+  textEditor_ = new InlineTextEdit(this);
+  textEditor_->hide();
+  textEditor_->setViewportMargins(0, 0, 0, 0);
+  textEditor_->setStyleSheet(
+      QStringLiteral("QPlainTextEdit { color: #ff375f; background: transparent; "
+                     "border: none; padding: 0;"
+                     " selection-background-color: #0a84ff; }"));
+  textEditor_->installEventFilter(this);
+  connect(textEditor_, &QPlainTextEdit::cursorPositionChanged, this, [this] {
+    textCaretOn_ = true;
+    textCaretTimer_.start();
+    update();
+  });
+  connect(textEditor_, &QPlainTextEdit::textChanged, this, [this] {
+    const QString text = textEditor_->toPlainText();
+    const QFontMetrics metrics(textEditor_->font());
+    int widestLine = 0;
+    const QStringList lines = text.split('\n');
+    for (const QString &line : lines)
+      widestLine = std::max(
+          widestLine, metrics.horizontalAdvance(line + QStringLiteral("  ")));
+    const int sidePadding =
+        textEditPill_ ? qRound(std::max(4.0, metrics.height() * 0.18)) : 0;
+    const int desiredWidth = std::max(48, widestLine + sidePadding * 2);
+    const int availableWidth =
+        std::max(48, qRound(editImageRect().right() - textEditor_->x()));
+    const int lineCount = std::max(1, static_cast<int>(lines.size()));
+    const int desiredHeight =
+        lineCount * metrics.lineSpacing() + metrics.descent() + 4;
+    textEditor_->resize(std::min(desiredWidth, availableWidth), desiredHeight);
+    textEditor_->verticalScrollBar()->setValue(0);
+    QTimer::singleShot(0, textEditor_, [editor = textEditor_] {
+      editor->verticalScrollBar()->setValue(0);
+    });
+    update();
+  });
+}
+
+bool CaptureEditor::textEditing() const {
+  return textEditor_ && textEditor_->isVisible();
 }
 
 void CaptureEditor::beginText(const QPointF &point, int annotationIndex,
                               int lineCapacity) {
+  ensureTextEditor();
   editingAnnotation_ = annotationIndex;
   QString existingText;
   if (annotationIndex >= 0 && annotationIndex < annotations_.size()) {
     const Annotation &annotation = annotations_.at(annotationIndex);
     textColor_ = annotation.color;
     textSize_ = annotation.size;
+    textEditFont_ = annotation.textFont;
     textPoint_ =
         annotation.start -
-        QPointF(0, QFontMetricsF(annotationTextFont(textSize_)).ascent());
+        QPointF(0, QFontMetricsF(annotationTextFont(textSize_, textEditFont_))
+                       .ascent());
     existingText = annotation.text;
     // An existing label has room for the lines it already has: Enter on its
     // last line commits, Shift+Enter adds one.
@@ -2610,12 +3116,13 @@ void CaptureEditor::beginText(const QPointF &point, int annotationIndex,
     textPoint_ = point;
     textColor_ = annotationColor();
     textSize_ = kTextSizes.at(static_cast<std::size_t>(textSizeIndex_));
+    textEditFont_ = textFont_;
   }
 
-  const QRectF image = editImageRect();
+  const QRectF sourceFrame = sourceFrameWidgetRect();
   const qreal scale = editScale();
-  const QPointF position = image.topLeft() + textPoint_ * scale;
-  QFont displayFont = annotationTextFont(textSize_);
+  const QPointF position = sourceFrame.topLeft() + textPoint_ * scale;
+  QFont displayFont = annotationTextFont(textSize_, textEditFont_);
   displayFont.setPixelSize(
       std::max(12, qRound(displayFont.pixelSize() * scale)));
   const QFontMetrics metrics(displayFont);
@@ -2649,16 +3156,20 @@ void CaptureEditor::beginText(const QPointF &point, int annotationIndex,
 }
 
 void CaptureEditor::acceptText(bool keepSelected) {
+  if (!textEditor_)
+    return;
   const QString text = textEditor_->toPlainText().trimmed();
   if (!text.isEmpty()) {
     Annotation annotation;
     annotation.kind = Annotation::Kind::Text;
     annotation.start =
         textPoint_ +
-        QPointF(0, QFontMetricsF(annotationTextFont(textSize_)).ascent());
+        QPointF(0, QFontMetricsF(annotationTextFont(textSize_, textEditFont_))
+                       .ascent());
     annotation.text = text;
     annotation.color = textColor_;
     annotation.size = textSize_;
+    annotation.textFont = textEditFont_;
     annotation.textBackground =
         editingAnnotation_ >= 0 && editingAnnotation_ < annotations_.size()
             ? annotations_.at(editingAnnotation_).textBackground
@@ -2884,15 +3395,20 @@ void CaptureEditor::finish(OutputMode mode) {
   const QRectF selection = selection_;
   const QVector<Annotation> annotations = annotations_;
   const BackgroundStyle background = backgroundStyle_;
+  const bool imageShadow = imageShadow_;
+  const CanvasBoundaryMode canvasBoundary = canvasBoundaryMode_;
+  const QImage backdrop = customBackdrop_;
   const QString appSlug =
       appFilenameSlug(dominantAppClass(capture_.windows, selection_));
   finishWatcher_.setFuture(QtConcurrent::run([captureCopy, selection,
-                                              annotations, background, appSlug,
-                                              mode]() {
+                                              annotations, background,
+                                              imageShadow, canvasBoundary,
+                                              backdrop, appSlug, mode]() {
     FinishResult result;
     result.mode = mode;
-    const QImage image =
-        renderCapture(captureCopy, selection, annotations, background);
+    const QImage image = renderCapture(captureCopy, selection, annotations,
+                                       background, imageShadow,
+                                       canvasBoundary, backdrop);
     if (!image.isNull())
       result.thumbnail = image.scaled(kRecentThumbEdge, kRecentThumbEdge,
                                       Qt::KeepAspectRatio,
@@ -2930,7 +3446,12 @@ void CaptureEditor::finish(OutputMode mode) {
 void CaptureEditor::completeFinish(const FinishResult &result) {
   if (!result.error.isEmpty()) {
     busy_ = false;
-    setStatus(result.error);
+    if (phase_ == Phase::Export) {
+      quickOutputMode_ = QuickOutputMode::None;
+      enterEdit(result.error);
+    } else {
+      setStatus(result.error);
+    }
     return;
   }
   if (!snapshotPath_.isEmpty()) {
@@ -2975,7 +3496,7 @@ void CaptureEditor::handleToolbar(const QString &action) {
   else if (action == QStringLiteral("tool-freehand"))
     tool_ = Tool::Freehand;
   else if (action == QStringLiteral("tool-highlighter"))
-    tool_ = Tool::Highlighter;
+    activateHighlighter();
   else if (action == QStringLiteral("tool-marker"))
     tool_ = Tool::Marker;
   else if (action == QStringLiteral("tool-rectangle") ||
@@ -3054,13 +3575,9 @@ void CaptureEditor::handleToolbar(const QString &action) {
     customColorPickerOpen_ = !customColorPickerOpen_;
   } else if (action == QStringLiteral("ocr"))
     runOcr();
-  else if (action == QStringLiteral("background")) {
-    const auto next = static_cast<BackgroundStyle>(
-        (static_cast<int>(backgroundStyle_) + 1) % 5);
-    setStatus(QStringLiteral("Backdrop: %1 · B cycles")
-                  .arg(backgroundName(next)));
-    commitBackground(next);
-  } else if (action == QStringLiteral("undo")) {
+  else if (action == QStringLiteral("background"))
+    cycleBackground();
+  else if (action == QStringLiteral("undo")) {
     undoEdit();
   } else if (action == QStringLiteral("redo")) {
     redoEdit();
@@ -3091,6 +3608,10 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
     // Esc only puts the card away; it should not also back out of the tool.
     if (key == Qt::Key_Escape)
       return;
+  }
+  if (phase_ == Phase::Export) {
+    event->accept();
+    return;
   }
   const Tool toolBefore = tool_;
   const QString statusBefore = status_;
@@ -3160,7 +3681,7 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
           if (!region.isEmpty()) {
             commitRegion(QRectF(region),
                          QStringLiteral("Last area restored · Select moves "
-                                        "layers · wheel zooms · outer handles "
+                                        "layers · Ctrl+wheel zooms · outer handles "
                                         "crop"));
             update();
           }
@@ -3223,7 +3744,7 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
     setStatus(QStringLiteral("Zoom %1% · + / - zoom · 0 fits · wheel scrolls")
                   .arg(qRound(viewZoom_ *
                               (baseImageRect().width() /
-                               std::max<qreal>(selection_.width(), 1)) *
+                               std::max<qreal>(canvasRect_.width(), 1)) *
                               100)));
     return;
   } else if (event->matches(QKeySequence::ZoomOut) ||
@@ -3233,7 +3754,7 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
     setStatus(QStringLiteral("Zoom %1% · + / - zoom · 0 fits · wheel scrolls")
                   .arg(qRound(viewZoom_ *
                               (baseImageRect().width() /
-                               std::max<qreal>(selection_.width(), 1)) *
+                               std::max<qreal>(canvasRect_.width(), 1)) *
                               100)));
     return;
   } else if (zoomModifier && event->key() == Qt::Key_0) {
@@ -3256,7 +3777,7 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
     if (selectedAnnotation_ >= 0 && selectedAnnotation_ < annotations_.size() &&
         selectedAnnotations_.size() <= 1 &&
         annotations_.at(selectedAnnotation_).kind == Annotation::Kind::Text &&
-        !dragging_ && !textEditor_->isVisible()) {
+        !dragging_ && !textEditing()) {
       tool_ = Tool::Select;
       beginText({}, selectedAnnotation_);
       update();
@@ -3278,10 +3799,10 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
                                 Qt::MetaModifier) &&
              selectedAnnotation_ >= 0 &&
              selectedAnnotation_ < annotations_.size() && !dragging_ &&
-             !textEditor_->isVisible()) {
+             !textEditing()) {
     nudgeSelectedAnnotation(nudge);
   } else if (viewZoom_ > 1.0 && selectedAnnotation_ < 0 && !dragging_ &&
-             !textEditor_->isVisible() &&
+             !textEditing() &&
              !event->modifiers().testAnyFlags(Qt::ControlModifier |
                                               Qt::AltModifier |
                                               Qt::MetaModifier) &&
@@ -3317,7 +3838,7 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
   } else if (event->key() == Qt::Key_F) {
     tool_ = Tool::Freehand;
   } else if (event->key() == Qt::Key_H) {
-    tool_ = Tool::Highlighter;
+    activateHighlighter();
   } else if (event->key() == Qt::Key_C || event->key() == Qt::Key_M) {
     tool_ = Tool::Marker;
   } else if (event->key() == Qt::Key_R || event->key() == Qt::Key_E) {
@@ -3380,6 +3901,9 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
   } else if (event->key() == Qt::Key_X) {
     tool_ = Tool::Cut;
     setStatus(QStringLiteral("Cut: drag across a band to remove it"));
+  } else if (event->key() == Qt::Key_T &&
+             event->modifiers() == Qt::ShiftModifier) {
+    cycleTextFont();
   } else if (event->key() == Qt::Key_T) {
     const bool textSelected =
         selectedAnnotation_ >= 0 && selectedAnnotation_ < annotations_.size() &&
@@ -3398,12 +3922,17 @@ void CaptureEditor::keyPressEvent(QKeyEvent *event) {
   } else if (event->key() == Qt::Key_P) {
     pinSnapshot();
     return;
+  } else if (event->key() == Qt::Key_G) {
+    cycleCanvasBoundary(
+        event->modifiers().testFlag(Qt::ShiftModifier));
   } else if (event->key() == Qt::Key_B) {
-    const auto next = static_cast<BackgroundStyle>(
-        (static_cast<int>(backgroundStyle_) + 1) % 5);
-    setStatus(QStringLiteral("Backdrop: %1 · B cycles")
-                  .arg(backgroundName(next)));
-    commitBackground(next);
+    if (event->modifiers().testFlag(Qt::ShiftModifier)) {
+      const bool next = !imageShadow_;
+      setStatus(QStringLiteral("Drop shadow: %1 · Shift+B toggles")
+                    .arg(next ? QStringLiteral("on") : QStringLiteral("off")));
+      commitBackground(backgroundStyle_, next);
+    } else
+      cycleBackground();
   } else if (event->key() >= Qt::Key_1 && event->key() <= Qt::Key_8) {
     colorIndex_ = event->key() - Qt::Key_1;
     usingCustomColor_ = false;
@@ -3445,6 +3974,12 @@ void CaptureEditor::keyReleaseEvent(QKeyEvent *event) {
   QWidget::keyReleaseEvent(event);
 }
 
+void CaptureEditor::leaveEvent(QEvent *event) {
+  highlighterPreview_.reset();
+  QWidget::leaveEvent(event);
+  update();
+}
+
 void CaptureEditor::mouseMoveEvent(QMouseEvent *event) {
   if (panning_) {
     panView(event->position() - panAnchor_);
@@ -3452,6 +3987,8 @@ void CaptureEditor::mouseMoveEvent(QMouseEvent *event) {
     return;
   }
   cursor_ = event->position();
+  if (phase_ == Phase::Export)
+    return;
   if (capturePending_)
     return;
   if (phase_ == Phase::Select) {
@@ -3534,7 +4071,11 @@ void CaptureEditor::mouseMoveEvent(QMouseEvent *event) {
                 isLayerResize(interaction_)) &&
                dragging_ && selectedAnnotation_ >= 0 &&
                selectedAnnotation_ < annotations_.size()) {
-      const QPointF point = toAnnotationPoint(cursor_);
+      // Keep the drag in the canvas mapping that existed at press time. The
+      // canvas settles once on release; re-fitting it under the pointer on
+      // every motion would feed the new scale back into the geometry and
+      // make an edge drag jitter.
+      const QPointF point = toUnclampedAnnotationPoint(cursor_);
       if (selectedAnnotations_.size() > 1 && interaction_ == Interaction::Move) {
         const QPointF delta = point - dragStart_;
         for (int position = 0;
@@ -3603,14 +4144,18 @@ void CaptureEditor::mouseMoveEvent(QMouseEvent *event) {
               std::clamp(originalAnnotation_.size * ratio, 1.0, 24.0);
           annotation.start.setY(
               originalBounds.top() +
-              QFontMetricsF(annotationTextFont(annotation.size)).ascent());
+              QFontMetricsF(
+                  annotationTextFont(annotation.size, annotation.textFont))
+                  .ascent());
         }
       }
       }
       dragChanged_ = true;
     }
     if (tool_ == Tool::Cut && dragging_) {
-      const QPointF point = toAnnotationPoint(cursor_);
+      QPointF point = toUnclampedAnnotationPoint(cursor_);
+      point.setX(std::clamp(point.x(), 0.0, selection_.width()));
+      point.setY(std::clamp(point.y(), 0.0, selection_.height()));
       const QPointF delta = point - cutDragStart_;
       if (!cutDragActive_ &&
           std::max(std::abs(delta.x()), std::abs(delta.y())) > 3.0) {
@@ -3642,19 +4187,24 @@ void CaptureEditor::mouseMoveEvent(QMouseEvent *event) {
         cutBandHi_ = hi;
         // Annotation space is selection-relative logical px; map to
         // absolute logical, then to native source px via the cached ratio.
+        // Floor the start and ceil the end so every pixel the drag covers
+        // is in the half-open band — round() drops a trailing sliver when
+        // the display scale is not 1 and the pointer sits on a pixel edge.
         liveCut_.sourceStart = static_cast<int>(
-            std::round((cutDragOriginOffset_ + lo) * cutDragRatio_));
+            std::floor((cutDragOriginOffset_ + lo) * cutDragRatio_));
         liveCut_.sourceEnd = static_cast<int>(
-            std::round((cutDragOriginOffset_ + hi) * cutDragRatio_));
+            std::ceil((cutDragOriginOffset_ + hi) * cutDragRatio_));
         liveCut_.logicalStart =
-            static_cast<int>(std::round(cutDragOriginOffset_ + lo));
+            static_cast<int>(std::floor(cutDragOriginOffset_ + lo));
         liveCut_.logicalEnd =
-            static_cast<int>(std::round(cutDragOriginOffset_ + hi));
+            static_cast<int>(std::ceil(cutDragOriginOffset_ + hi));
       }
     }
     if ((tool_ == Tool::Freehand || tool_ == Tool::Highlighter) && dragging_ &&
         interaction_ == Interaction::None) {
-      const QPointF point = toAnnotationPoint(cursor_);
+      QPointF point = toUnclampedAnnotationPoint(cursor_);
+      if (tool_ == Tool::Highlighter && highlighterLock_)
+        point.setY(highlighterLock_->centerY);
       if (freehandPoints_.isEmpty() ||
           QLineF(freehandPoints_.last(), point).length() >= 1.5)
         freehandPoints_.push_back(point);
@@ -3740,7 +4290,7 @@ void CaptureEditor::mouseDoubleClickEvent(QMouseEvent *event) {
 }
 
 void CaptureEditor::mousePressEvent(QMouseEvent *event) {
-  if (busy_ || capturePending_)
+  if (phase_ == Phase::Export || busy_ || capturePending_)
     return;
   if (!ocrResultText_.isEmpty())
     dismissOcrOverlay();
@@ -3752,7 +4302,7 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
         update();
       }
     } else if (phase_ == Phase::Edit) {
-      if (textEditor_->isVisible())
+      if (textEditing())
         acceptText();
       if (dragging_) {
         handleEscape();
@@ -3767,7 +4317,8 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
     return;
   }
   if (event->button() == Qt::MiddleButton) {
-    if (phase_ == Phase::Edit && viewZoom_ > 1.0) {
+    if (phase_ == Phase::Edit && viewZoom_ > 1.0 &&
+        !textEditing()) {
       panning_ = true;
       panAnchor_ = event->position();
       setCursor(Qt::ClosedHandCursor);
@@ -3779,13 +4330,13 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
   cursor_ = event->position();
   endNudgeRun();
   if (const int tab = selectTabAt(cursor_); tab >= 0) {
-    if (phase_ == Phase::Edit && textEditor_->isVisible())
+    if (phase_ == Phase::Edit && textEditing())
       acceptText();
     activateSelectTab(selectTabItems().at(tab).kind);
     return;
   }
   if (phase_ == Phase::Edit && scrollPillRect().contains(cursor_)) {
-    if (textEditor_->isVisible())
+    if (textEditing())
       acceptText();
     const QRect region = selection_.toRect();
     returnToSelect(false);
@@ -3825,7 +4376,9 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
     tool_ = Tool::Text;
     const qreal localX = cursor_.x() - textSizePanelRect().left();
     textSizeIndex_ = std::clamp(static_cast<int>(localX / 34.0), 0, 2);
-    setStatus(QStringLiteral("Neucha · size %1 · wheel changes size")
+    setStatus(QStringLiteral("%1 · size %2 · wheel changes size · Shift+T "
+                             "cycles font")
+                  .arg(annotationTextFontName(textFont_))
                   .arg(QString::fromLatin1(kTextSizeNames.at(
                       static_cast<std::size_t>(textSizeIndex_)))));
     update();
@@ -3833,7 +4386,7 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
   }
 
   // Clicking away keeps whatever was typed; Enter belongs to multiline text.
-  if (textEditor_->isVisible())
+  if (textEditing())
     acceptText();
 
   for (const ToolbarButton &button : toolbarButtons()) {
@@ -3842,11 +4395,11 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
       return;
     }
   }
-  if (tool_ == Tool::Select) {
+  if (tool_ == Tool::Select && selectedAnnotations_.isEmpty()) {
     const int cropHandle = cropHandleAt(cursor_);
     if (cropHandle >= 0) {
       originalSelection_ = selection_;
-      cropDragImageRect_ = editImageRect();
+      cropDragImageRect_ = sourceFrameWidgetRect();
       interaction_ = static_cast<Interaction>(
           static_cast<int>(Interaction::CropTopLeft) + cropHandle);
       dragStartState_ = editState();
@@ -3862,8 +4415,7 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
   }
   // A layer that ran off the capture keeps its handles and body live outside
   // the canvas, so it can be resized or dragged back in instead of being
-  // stranded. Drags still follow the clamped pointer, so this only ever pulls
-  // layers back; anything else outside the canvas stays inert.
+  // stranded. Anything else outside the canvas stays inert.
   const bool insideImage = editImageRect().contains(cursor_);
   const QPointF point = insideImage ? toAnnotationPoint(cursor_)
                                     : toUnclampedAnnotationPoint(cursor_);
@@ -3871,8 +4423,11 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
       (tool_ != Tool::Select || !selectedLayerAcceptsPoint(point)))
     return;
   if (tool_ == Tool::Eyedropper) {
+    if (!sourceFrameWidgetRect().contains(cursor_))
+      return;
     customColor_ = sampleSourceColor(capture_.source, capture_.previewSize,
-                                     selection_, editImageRect(), cursor_);
+                                     selection_, sourceFrameWidgetRect(),
+                                     cursor_);
     usingCustomColor_ = true;
     if (customColor_.hsvHueF() >= 0)
       customHue_ = customColor_.hsvHueF();
@@ -4045,7 +4600,7 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
   if (tool_ == Tool::Marker) {
     Annotation annotation;
     annotation.kind = Annotation::Kind::Marker;
-    annotation.start = point;
+    annotation.start = markerPlacementPoint(cursor_);
     annotation.number = nextMarker_;
     annotation.color = annotationColor();
     annotation.size = annotationSize_;
@@ -4080,7 +4635,16 @@ void CaptureEditor::mousePressEvent(QMouseEvent *event) {
     if (tool_ == Tool::Freehand || tool_ == Tool::Highlighter) {
       freehandPoints_.clear();
       freehandPoints_.reserve(256);
-      freehandPoints_.push_back(point);
+      highlighterLock_.reset();
+      QPointF strokeStart = point;
+      if (tool_ == Tool::Highlighter &&
+          highlighterMode_ == HighlighterMode::Snap)
+        highlighterLock_ = highlighterLockAt(point);
+      if (highlighterLock_)
+        strokeStart.setY(highlighterLock_->centerY);
+      freehandPoints_.push_back(strokeStart);
+      if (tool_ == Tool::Highlighter)
+        updatePointerCursor();
     }
   }
   update();
@@ -4220,9 +4784,12 @@ void CaptureEditor::mouseReleaseEvent(QMouseEvent *event) {
     return;
   }
 
-  const QLineF span = creationSpan(toAnnotationPoint(event->position()));
+  const QLineF span =
+      creationSpan(toUnclampedAnnotationPoint(event->position()));
   const QPointF start = span.p1();
-  const QPointF end = span.p2();
+  QPointF end = span.p2();
+  if (tool_ == Tool::Highlighter && highlighterLock_)
+    end.setY(highlighterLock_->centerY);
   creationConstraintActive_ = false;
   creationCenteredActive_ = false;
   if (tool_ == Tool::Freehand || tool_ == Tool::Highlighter) {
@@ -4241,16 +4808,18 @@ void CaptureEditor::mouseReleaseEvent(QMouseEvent *event) {
       annotation.start = freehandPoints_.first();
       annotation.end = freehandPoints_.last();
       annotation.color = annotationColor();
-      annotation.size = annotationSize_;
+      annotation.size = highlighter && highlighterLock_
+                            ? highlighterLock_->annotationSize
+                            : annotationSize_;
       annotation.points = std::move(freehandPoints_);
       selectedAnnotation_ = -1;
-      setStatus(
-          highlighter
-              ? QStringLiteral("Highlight added · Esc for select mode")
-              : QStringLiteral("Stroke added · Esc for select mode"));
+      setStatus(highlighter ? highlighterStatus()
+                            : QStringLiteral("Stroke added · Esc for select "
+                                             "mode"));
       commitAnnotate(std::move(annotation));
     }
     freehandPoints_.clear();
+    highlighterLock_.reset();
     dragging_ = false;
     updatePointerCursor();
     update();
@@ -4264,7 +4833,7 @@ void CaptureEditor::mouseReleaseEvent(QMouseEvent *event) {
     } else {
       const qreal size = kTextSizes.at(static_cast<std::size_t>(textSizeIndex_));
       const qreal lineHeight =
-          QFontMetricsF(annotationTextFont(size)).lineSpacing();
+          QFontMetricsF(annotationTextFont(size, textFont_)).lineSpacing();
       const int lines = std::max(
           1, static_cast<int>(std::floor(box.height() / lineHeight + 0.25)));
       beginText(box.topLeft(), -1, lines);
@@ -4333,6 +4902,13 @@ void CaptureEditor::wheelEvent(QWheelEvent *event) {
     QWidget::wheelEvent(event);
     return;
   }
+  if (textEditing()) {
+    // The draft widget is laid out for the view it opened in; a zoom or pan
+    // under it would leave the text adrift mid-edit. The view holds still
+    // until the text commits.
+    event->accept();
+    return;
+  }
   // High-resolution touchpads can arrive with an empty angleDelta and only a
   // pixelDelta; treat the two interchangeably, preferring the exact pixels
   // for panning and the notch units for discrete steps.
@@ -4366,7 +4942,7 @@ void CaptureEditor::wheelEvent(QWheelEvent *event) {
                              "sideways · Ctrl+0 fits")
                   .arg(qRound(viewZoom_ *
                               (baseImageRect().width() /
-                               std::max<qreal>(selection_.width(), 1)) *
+                               std::max<qreal>(canvasRect_.width(), 1)) *
                               100)));
   };
   // One notch is one step; a touchpad's finer increments are a fraction of
@@ -4423,7 +4999,9 @@ void CaptureEditor::wheelEvent(QWheelEvent *event) {
     adjustSelectedAnnotation(step);
   } else if (tool_ == Tool::Text) {
     textSizeIndex_ = std::clamp(textSizeIndex_ + step, 0, 2);
-    setStatus(QStringLiteral("Neucha · size %1 · wheel changes size")
+    setStatus(QStringLiteral("%1 · size %2 · wheel changes size · Shift+T "
+                             "cycles font")
+                  .arg(annotationTextFontName(textFont_))
                   .arg(QString::fromLatin1(kTextSizeNames.at(
                       static_cast<std::size_t>(textSizeIndex_)))));
   } else if (tool_ == Tool::Spotlight &&
@@ -4477,8 +5055,10 @@ void CaptureEditor::wheelEvent(QWheelEvent *event) {
              tool_ == Tool::Marker || tool_ == Tool::Rectangle ||
              tool_ == Tool::Ellipse) {
     annotationSize_ = std::clamp(annotationSize_ + step, 2.0, 12.0);
-    setStatus(QStringLiteral("Size %1 · mouse wheel changes size")
-                  .arg(qRound(annotationSize_)));
+    setStatus(tool_ == Tool::Highlighter
+                  ? highlighterStatus()
+                  : QStringLiteral("Size %1 · mouse wheel changes size")
+                        .arg(qRound(annotationSize_)));
   } else {
     QWidget::wheelEvent(event);
     return;
@@ -4488,6 +5068,11 @@ void CaptureEditor::wheelEvent(QWheelEvent *event) {
 }
 
 void CaptureEditor::updatePointerCursor() {
+  highlighterPreview_.reset();
+  if (phase_ == Phase::Export) {
+    setCursor(Qt::WaitCursor);
+    return;
+  }
   if (phase_ == Phase::Select) {
     setCursor(windowMode_ || selectTabAt(cursor_) >= 0 ||
                       (recentsOpen_ && recentAt(cursor_) >= 0)
@@ -4523,7 +5108,8 @@ void CaptureEditor::updatePointerCursor() {
     return;
   }
   if (tool_ == Tool::Select) {
-    int cropHandle = cropHandleAt(cursor_);
+    int cropHandle =
+        selectedAnnotations_.isEmpty() ? cropHandleAt(cursor_) : -1;
     if (dragging_ && interaction_ >= Interaction::CropTopLeft) {
       cropHandle = static_cast<int>(interaction_) -
                    static_cast<int>(Interaction::CropTopLeft);
@@ -4550,6 +5136,18 @@ void CaptureEditor::updatePointerCursor() {
     setCursor(Qt::IBeamCursor);
   else if (tool_ == Tool::Cut)
     setCursor(Qt::CrossCursor);
+  else if (tool_ == Tool::Highlighter) {
+    if (highlighterMode_ == HighlighterMode::Snap) {
+      highlighterPreview_ =
+          dragging_ ? highlighterLock_
+                    : editImageRect().contains(cursor_)
+                          ? highlighterLockAt(toAnnotationPoint(cursor_))
+                          : std::nullopt;
+    }
+    // Qt's stock I-beam has a fixed text-editor height. Paint the measured
+    // one ourselves so its serifs span exactly the row the stroke will lock.
+    setCursor(highlighterPreview_ ? Qt::BlankCursor : Qt::CrossCursor);
+  }
   else
     setCursor(Qt::CrossCursor);
 }
@@ -4567,32 +5165,36 @@ void CaptureEditor::refreshBackdropCache() {
   const QSize deviceSize = (QSizeF(size()) * ratio).toSize();
   const qint64 sourceKey = capture_.source.cacheKey();
   if (deviceSize.isEmpty()) {
-    backdrop_ = {};
     dimmedBackdrop_ = {};
     backdropSize_ = {};
     return;
   }
-  if (!backdrop_.isNull() && backdropSize_ == deviceSize &&
+  if (!dimmedBackdrop_.isNull() && backdropSize_ == deviceSize &&
       backdropKey_ == sourceKey && qFuzzyCompare(backdropRatio_, ratio))
     return;
 
+  StartupTimingScope timing("rebuild dimmed backdrop cache");
   backdropSize_ = deviceSize;
   backdropRatio_ = ratio;
   backdropKey_ = sourceKey;
-  backdrop_ = QPixmap(deviceSize);
-  backdrop_.setDevicePixelRatio(ratio);
-  backdrop_.fill(Qt::transparent);
-  {
-    QPainter cache(&backdrop_);
-    cache.setRenderHint(QPainter::SmoothPixmapTransform, true);
-    cache.drawImage(QRectF(QPointF(), QSizeF(deviceSize) / ratio),
-                    capture_.source);
-  }
-  dimmedBackdrop_ = backdrop_.copy();
+  dimmedBackdrop_ = QPixmap(deviceSize);
+  dimmedBackdrop_.setDevicePixelRatio(ratio);
   {
     QPainter cache(&dimmedBackdrop_);
-    cache.fillRect(QRectF(QPointF(), QSizeF(deviceSize) / ratio),
-                   QColor(0, 0, 0, kBackdropDim));
+    cache.setRenderHint(QPainter::SmoothPixmapTransform,
+                        deviceSize != capture_.source.size());
+    cache.setCompositionMode(QPainter::CompositionMode_Source);
+    {
+      StartupTimingScope drawTiming("draw source into backdrop cache");
+      cache.drawImage(QRectF(QPointF(), QSizeF(deviceSize) / ratio),
+                      capture_.source);
+    }
+    cache.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    {
+      StartupTimingScope dimTiming("dim backdrop cache");
+      cache.fillRect(QRectF(QPointF(), QSizeF(deviceSize) / ratio),
+                     QColor(0, 0, 0, kBackdropDim));
+    }
   }
 }
 
@@ -4670,7 +5272,7 @@ void CaptureEditor::commitRegion(const QRectF &region,
     return;
   }
   editedKind_ = SelectTab::Region;
-  enterEdit(editStatus);
+  enterSelectedCapture(editStatus);
 }
 
 void CaptureEditor::startScrollCapture(const QRect &region) {
@@ -4704,8 +5306,11 @@ void CaptureEditor::startScrollCapture(const QRect &region) {
 void CaptureEditor::endScrollCapture() {
   if (!scrollPanel_)
     return;
-  // Deleting restores the surface's mask and keyboard grab.
-  delete scrollPanel_;
+  // This runs from the panel's own signals (emitted inside its event
+  // handlers), so the surface is handed back now but the object goes once
+  // the stack has unwound.
+  scrollPanel_->release();
+  scrollPanel_->deleteLater();
   scrollPanel_ = nullptr;
   setFocus(Qt::OtherFocusReason);
   updatePointerCursor();
@@ -4713,6 +5318,9 @@ void CaptureEditor::endScrollCapture() {
 }
 
 void CaptureEditor::adoptStitched(const QImage &image) {
+  qInfo().noquote() << QStringLiteral("scroll: editing stitched %1x%2")
+                           .arg(image.width())
+                           .arg(image.height());
   if (image.isNull()) {
     setScrollMode(true);
     return;
@@ -4728,7 +5336,8 @@ void CaptureEditor::adoptStitched(const QImage &image) {
                        .arg(image.width())
                        .arg(image.height())
                  : QStringLiteral("Scroll capture stitched · Select moves "
-                                  "layers · wheel zooms · outer handles crop"));
+                                  "layers · Ctrl+wheel zooms · outer handles "
+                                  "crop"));
 }
 
 void CaptureEditor::adoptImage(QImage image, OperationLog log, SelectTab kind,
@@ -4740,7 +5349,7 @@ void CaptureEditor::adoptImage(QImage image, OperationLog log, SelectTab kind,
   // it again.
   if (scrollPanel_)
     endScrollCapture();
-  if (textEditor_->isVisible()) {
+  if (textEditing()) {
     textEditor_->clear();
     textEditor_->hide();
     textCaretTimer_.stop();
@@ -4775,11 +5384,11 @@ void CaptureEditor::adoptImage(QImage image, OperationLog log, SelectTab kind,
   // A fresh working document: the old snapshot belonged to the screen.
   snapshotPath_.clear();
   sourceWritten_ = false;
-  enterEdit(status);
+  enterSelectedCapture(status);
 }
 
 void CaptureEditor::returnToSelect(bool windowMode) {
-  if (textEditor_->isVisible()) {
+  if (textEditing()) {
     textEditor_->clear();
     textEditor_->hide();
     textCaretTimer_.stop();
@@ -4820,7 +5429,7 @@ void CaptureEditor::returnToSelect(bool windowMode) {
   scheduleSnapshot();
   setStatus(windowMode_
                 ? QStringLiteral("Window mode · click or Super+Arrows then "
-                                 "Enter · Space returns to area")
+                                 "Enter · Space selects a scrolling region")
                 : QStringLiteral(
                       "Drag to select an area · Space selects a window"));
   updatePointerCursor();
@@ -4858,7 +5467,7 @@ void CaptureEditor::setWindowMode(bool enabled) {
   hoveredWindow_ = windowMode_ ? windowAt(cursor_) : -1;
   setStatus(windowMode_
                 ? QStringLiteral("Window mode · click or Super+Arrows then "
-                                 "Enter · Space returns to area")
+                                 "Enter · Space selects a scrolling region")
                 : QStringLiteral(
                       "Drag to select an area · Space selects a window"));
   updatePointerCursor();
@@ -5084,27 +5693,41 @@ void CaptureEditor::paintRecents(QPainter &painter) {
 }
 
 void CaptureEditor::reopenRecent(int index) {
-  if (index < 0 || index >= recents_.size())
+  if (index < 0 || index >= recents_.size() || reopenPending_)
     return;
   // The earlier working document opens here, in place of a new capture:
   // same surface, layers still editable. Nothing was captured yet, so there
-  // is no snapshot to clean up.
+  // is no snapshot to clean up. A shelved capture can be a stitched scroll
+  // result tens of megapixels large, so the decode runs on the worker pool
+  // rather than blocking the click that asked for it.
   const RecentSnap recent = recents_.at(index);
-  QImage image;
-  if (!image.load(recent.sourcePath)) {
-    setStatus(QStringLiteral("Could not load that capture"));
-    return;
-  }
-  OperationLog log;
-  QString error;
-  if (!recent.logPath.isEmpty() &&
-      !loadOperationLog(recent.logPath, log, error)) {
-    setStatus(QStringLiteral("Could not restore its layers: %1").arg(error));
-    return;
-  }
+  reopenPending_ = true;
   setRecentsOpen(false);
-  editingRecent_ = recent;
-  adoptImage(std::move(image), std::move(log), SelectTab::Region,
+  setStatus(QStringLiteral("Opening…"));
+  reopenWatcher_.setFuture(QtConcurrent::run([recent] {
+    ReopenResult result;
+    result.recent = recent;
+    if (!result.image.load(recent.sourcePath)) {
+      result.error = QStringLiteral("Could not load that capture");
+      return result;
+    }
+    if (!recent.logPath.isEmpty() &&
+        !loadOperationLog(recent.logPath, result.log, result.error))
+      result.image = {};
+    return result;
+  }));
+}
+
+void CaptureEditor::completeReopenRecent(const ReopenResult &result) {
+  reopenPending_ = false;
+  if (result.image.isNull()) {
+    setStatus(result.error.isEmpty()
+                  ? QStringLiteral("Could not restore that capture")
+                  : result.error);
+    return;
+  }
+  editingRecent_ = result.recent;
+  adoptImage(result.image, result.log, SelectTab::Region,
              QStringLiteral("Reopened recent capture · Copy/Save to output"));
 }
 
@@ -5114,7 +5737,7 @@ void CaptureEditor::selectFullscreen() {
   hoveredWindow_ = -1;
   selection_ = QRectF(QPointF(), capture_.previewSize);
   editedKind_ = SelectTab::Fullscreen;
-  enterEdit(QStringLiteral(
+  enterSelectedCapture(QStringLiteral(
       "Full screen selected · native resolution · outer handles crop"));
   update();
 }
@@ -5134,17 +5757,36 @@ void CaptureEditor::paintSelect(QPainter &painter) {
     return;
   }
   refreshBackdropCache();
-  painter.drawPixmap(rect(), dimmedBackdrop_);
+  {
+    StartupTimingScope timing("blit cached backdrop to overlay");
+    painter.drawPixmap(rect(), dimmedBackdrop_);
+  }
+  const bool exporting = phase_ == Phase::Export;
+  // Drawn first, low-opacity, no card: the live/frozen screen, the tabs, the
+  // selection all paint over it wherever they overlap.
+  if (!exporting)
+    drawHotkeyLegend(painter, rect(),
+                     {{QStringLiteral("Drag"), QStringLiteral("Area")},
+                      {QStringLiteral("Space"), QStringLiteral("Window")},
+                      {QStringLiteral("Ctrl+A"), QStringLiteral("Fullscreen")},
+                      {QStringLiteral("R"), QStringLiteral("Last region")},
+                      {QStringLiteral("S"), QStringLiteral("Scrolling region")},
+                      {QStringLiteral("Esc"), QStringLiteral("Close")}});
 
   const bool haveHole =
-      windowMode_ ? hoveredWindow_ >= 0 && hoveredWindow_ < capture_.windows.size()
-                  : !selection_.isEmpty();
+      exporting ? !selection_.isEmpty()
+      : windowMode_ ? hoveredWindow_ >= 0 && hoveredWindow_ < capture_.windows.size()
+                    : !selection_.isEmpty();
   if (haveHole) {
+    const bool previewCoordinates =
+        windowMode_ || (exporting && editedKind_ != SelectTab::Region);
     const QRectF previewHole =
         windowMode_ ? QRectF(capture_.windows.at(hoveredWindow_).rect)
-                    : mapWidgetToPreview(selection_);
-    const QRectF destHole =
-        windowMode_ ? mapPreviewToWidget(previewHole) : selection_;
+        : previewCoordinates ? selection_
+                             : mapWidgetToPreview(selection_);
+    const QRectF destHole = previewCoordinates
+                                ? mapPreviewToWidget(previewHole)
+                                : selection_;
     painter.save();
     painter.setClipRect(destHole, Qt::IntersectClip);
     painter.drawImage(destHole, capture_.source, sourceRect(previewHole));
@@ -5160,28 +5802,26 @@ void CaptureEditor::paintSelect(QPainter &painter) {
       painter.drawRect(mapPreviewToWidget(QRectF(window.rect)));
     }
   } else if (!selection_.isEmpty()) {
+    const QRectF outline = exporting && editedKind_ != SelectTab::Region
+                               ? mapPreviewToWidget(selection_)
+                               : selection_;
     painter.setPen(QPen(Qt::white, 2));
     painter.setBrush(Qt::NoBrush);
-    painter.drawRect(selection_);
+    painter.drawRect(outline);
   }
 
-  if (!windowMode_ && !dragging_ && !recentsOpen_) {
+  if (!exporting && !windowMode_ && !dragging_ && !recentsOpen_) {
     painter.setPen(QPen(QColor(255, 255, 255, 56), 1));
     painter.drawLine(QPointF(cursor_.x(), 0), QPointF(cursor_.x(), height()));
     painter.drawLine(QPointF(0, cursor_.y()), QPointF(width(), cursor_.y()));
   }
-  paintRecents(painter);
-
-  paintSelectTabs(painter);
-  drawHotkeyLegend(painter, rect(), cursor_,
-                   {{QStringLiteral("Drag"), QStringLiteral("Area")},
-                    {QStringLiteral("Space"), QStringLiteral("Window")},
-                    {QStringLiteral("Ctrl+A"), QStringLiteral("Fullscreen")},
-                    {QStringLiteral("R"), QStringLiteral("Last region")},
-                    {QStringLiteral("S"), QStringLiteral("Scrolling region")},
-                    {QStringLiteral("Esc"), QStringLiteral("Close")}});
+  if (!exporting) {
+    paintRecents(painter);
+    paintSelectTabs(painter);
+  }
   drawStatusPill(painter, rect(), status_);
-  drawMeasureBadge(painter, rect(), cursor_, measurementText());
+  if (!exporting)
+    drawMeasureBadge(painter, rect(), cursor_, measurementText());
 }
 
 qreal selectionBoundsRadius(const Annotation &annotation, qreal inset) {
@@ -5200,39 +5840,66 @@ void CaptureEditor::paintEdit(QPainter &painter) {
   painter.setCompositionMode(QPainter::CompositionMode_Source);
   painter.fillRect(rect(), QColor(0, 0, 0, 160));
   painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+  // Drawn first, low-opacity, no card: anything painted afterward (the
+  // image, the toolbar, a popup) simply covers it wherever they overlap.
+  drawHotkeyLegend(
+      painter, rect(),
+      {{QStringLiteral("V"), QStringLiteral("Select / move layer")},
+       {QStringLiteral("A"), QStringLiteral("Arrow")},
+       {QStringLiteral("L"), QStringLiteral("Line")},
+       {QStringLiteral("F / H"), QStringLiteral("Freehand / Highlighter")},
+       {QStringLiteral("C"), QStringLiteral("Marker")},
+       {QStringLiteral("R / E"), QStringLiteral("Rectangle / Ellipse")},
+       {QStringLiteral("X"), QStringLiteral("Cut out a band")},
+       {QStringLiteral("T"), QStringLiteral("Text")},
+       {QStringLiteral("Double click"), QStringLiteral("Edit text layer")},
+       {QStringLiteral("1–8"), QStringLiteral("Color")},
+       {QStringLiteral("Wheel"), QStringLiteral("Zoom selected / tool size")},
+       {QStringLiteral("D / O"), QStringLiteral("Redact / OCR text")},
+       {QStringLiteral("B / P"), QStringLiteral("Backdrop / Pin on screen")},
+       {QStringLiteral("Ctrl+Z"), QStringLiteral("Undo")},
+       {QStringLiteral("Ctrl+Shift+Z"), QStringLiteral("Redo")},
+       {QStringLiteral("Enter"), QStringLiteral("Copy + save")},
+       {QStringLiteral("Ctrl+C"), QStringLiteral("Copy only")},
+       {QStringLiteral("Ctrl+S"), QStringLiteral("Save only")},
+       {QStringLiteral("Esc"), QStringLiteral("Arrow / twice close")}});
   // When zoomed past fit the image is larger than the viewport; clip content
   // to the band between the toolbar and the status so it cannot overdraw them.
   const bool clipViewport = viewZoom_ > 1.0;
   if (clipViewport) {
     painter.save();
-    painter.setClipRect(QRectF(0, 60, width(), std::max(1, height() - 116)));
+    const qreal top = imageTopMargin();
+    painter.setClipRect(
+        QRectF(0, top, width(), std::max<qreal>(1, height() - top - 58)));
   }
   const QRectF image = editImageRect();
-  const bool hasBackground = backgroundStyle_ != BackgroundStyle::None;
-  if (hasBackground) {
+  const QRectF sourceImage = sourceFrameWidgetRect();
+  const bool grown = canvasGrown();
+  const BackgroundStyle background = effectiveBackgroundStyle();
+  const bool hasBackground =
+      background != BackgroundStyle::None &&
+      background != BackgroundStyle::Off &&
+      (background != BackgroundStyle::Custom || !customBackdrop_.isNull());
+  const bool framedBackground =
+      hasBackground && canvasBoundaryMode_ == CanvasBoundaryMode::Framed;
+  if (grown) {
+    // Extension is the canvas itself, while the source remains the image card
+    // floating above it. Never shadow the expanded canvas edge.
+    paintCaptureBackground(painter, image, background, customBackdrop_);
+    if (imageShadow_ && hasBackground)
+      paintCaptureImageShadow(painter, sourceImage);
+  } else if (framedBackground) {
     const QRectF backing = image.adjusted(-28, -28, 28, 28);
-    painter.setPen(Qt::NoPen);
-    for (int layer = 20; layer > 0; --layer) {
-      const qreal spread = layer * 0.7;
-      painter.setBrush(QColor(0, 0, 0, 3 + (20 - layer) / 3));
-      painter.drawRoundedRect(
-          image.adjusted(-spread, -spread + 12, spread, spread + 12),
-          15 + spread, 15 + spread);
-    }
-    for (int layer = 10; layer > 0; --layer) {
-      const qreal spread = layer * 0.45;
-      painter.setBrush(QColor(0, 0, 0, 5 + (10 - layer) * 2));
-      painter.drawRoundedRect(
-          image.adjusted(-spread, -spread + 7, spread, spread + 7), 12 + spread,
-          12 + spread);
-    }
-    paintCaptureBackground(painter, backing, backgroundStyle_);
+    paintCaptureBackground(painter, backing, background, customBackdrop_);
+    if (imageShadow_)
+      paintCaptureImageShadow(painter, image);
   }
 
   QPainterPath clip;
-  clip.addRoundedRect(image, hasBackground ? 10 : 0, hasBackground ? 10 : 0);
-  const QSize targetSize(qRound(image.width() * devicePixelRatioF()),
-                         qRound(image.height() * devicePixelRatioF()));
+  const qreal sourceRadius = !grown && framedBackground ? 10.0 : 0.0;
+  clip.addRoundedRect(sourceImage, sourceRadius, sourceRadius);
+  const QSize targetSize(qRound(sourceImage.width() * devicePixelRatioF()),
+                         qRound(sourceImage.height() * devicePixelRatioF()));
   // Cache the un-annotated selection at display resolution. Rebuilding it
   // from the native source every pointer move would stall large captures.
   if (redactionBaseStale_ || redactionBaseSize_ != targetSize ||
@@ -5266,7 +5933,7 @@ void CaptureEditor::paintEdit(QPainter &painter) {
     Annotation preview;
     preview.kind = Annotation::Kind::Redaction;
     preview.start = dragStart_;
-    preview.end = toAnnotationPoint(cursor_);
+    preview.end = toUnclampedAnnotationPoint(cursor_);
     preview.redactionStyle = redactionStyle_;
     preview.redactionSeed = activeRedactionSeed_;
     redactionLayer = applyRedactionsScaled(redactionLayerCache_, {preview},
@@ -5276,17 +5943,23 @@ void CaptureEditor::paintEdit(QPainter &painter) {
   painter.save();
   painter.setClipPath(clip);
   if (!redactionLayer.isNull())
-    painter.drawImage(image, redactionLayer);
+    painter.drawImage(sourceImage, redactionLayer);
   else
-    painter.drawImage(image, capture_.source, sourceRect(selection_));
+    painter.drawImage(sourceImage, capture_.source, sourceRect(selection_));
 
   painter.restore();
 
+  QImage defaultLayerSource = redactionLayer;
+  QRectF defaultLayerBounds(QPointF(), selection_.size());
+
   painter.save();
-  painter.translate(image.topLeft());
+  painter.translate(sourceImage.topLeft());
   painter.scale(editScale(), editScale());
   painter.save();
-  painter.setClipRect(QRectF(QPointF(), selection_.size()));
+  // While a layer is being carried, let it remain visible over the surround;
+  // the background settles to its final integer bounds once on release.
+  if (!dragging_)
+    painter.setClipRect(canvasRect_);
   QVector<Annotation> defaultAnnotations;
   defaultAnnotations.reserve(annotations_.size() + 1);
   for (int index = 0; index < annotations_.size(); ++index) {
@@ -5320,17 +5993,20 @@ void CaptureEditor::paintEdit(QPainter &painter) {
         if (tool_ == Tool::Rectangle)
           preview.cornerRadius = cornerRadius_;
       }
-      const QLineF span = creationSpan(toAnnotationPoint(cursor_));
+      const QLineF span =
+          creationSpan(toUnclampedAnnotationPoint(cursor_));
       preview.start = span.p1();
       preview.end = span.p2();
     }
     preview.color = tool_ == Tool::Ocr ? QColor(Qt::white) : annotationColor();
     if (tool_ == Tool::Text)
       preview.color.setAlpha(150);
-    preview.size = tool_ == Tool::Ocr          ? 2.0
+    preview.size = tool_ == Tool::Ocr         ? 2.0
                    : tool_ == Tool::Text      ? 1.0
                    : tool_ == Tool::Spotlight ? spotlightBorder_
-                                              : annotationSize_;
+                   : tool_ == Tool::Highlighter && highlighterLock_
+                       ? highlighterLock_->annotationSize
+                       : annotationSize_;
     defaultAnnotations.push_back(std::move(preview));
   } else if (tool_ == Tool::Marker && image.contains(cursor_) && !dragging_ &&
              !pointerGrabsLayer()) {
@@ -5339,23 +6015,108 @@ void CaptureEditor::paintEdit(QPainter &painter) {
     // press moves that counter instead.
     Annotation preview;
     preview.kind = Annotation::Kind::Marker;
-    preview.start = toAnnotationPoint(cursor_);
+    preview.start = markerPlacementPoint(cursor_);
     preview.number = nextMarker_;
     preview.color = annotationColor();
     preview.color.setAlpha(185);
     preview.size = annotationSize_;
     defaultAnnotations.push_back(std::move(preview));
   }
-  // Default-layer tools (including spotlight) sample the redaction layer,
-  // never the raw capture. The layer image is already the selection crop.
-  if (!redactionLayer.isNull()) {
-    paintDefaultLayer(painter, redactionLayer,
-                      QRectF(QPointF(), selection_.size()), defaultAnnotations);
+  QRectF previewClip = canvasRect_;
+  if (dragging_ && canvasBoundaryMode_ != CanvasBoundaryMode::Framed) {
+    previewClip = captureCanvasRect(selection_.size(), defaultAnnotations,
+                                    canvasBoundaryMode_);
+  }
+  if (previewClip != canvasRect_) {
+    QPainterPath overscan;
+    overscan.addRect(previewClip);
+    QPainterPath settledCanvas;
+    settledCanvas.addRect(canvasRect_);
+    overscan = overscan.subtracted(settledCanvas);
+    const bool previewGrown =
+        previewClip != QRectF(QPointF(), selection_.size());
+    const bool automaticPreviewBackground =
+        canvasBoundaryMode_ == CanvasBoundaryMode::Framed && previewGrown &&
+        backgroundStyle_ == BackgroundStyle::None;
+    const BackgroundStyle previewBackground =
+        automaticPreviewBackground ? BackgroundStyle::Slate : background;
+    painter.save();
+    painter.setClipPath(overscan, Qt::IntersectClip);
+    paintCaptureBackground(painter, previewClip, previewBackground);
+    painter.restore();
+  }
+  // Framed mode shows the complete layer while it is being carried and
+  // settles the background on release. Overflow and Image preview their final
+  // canvas bounds live.
+  if (!dragging_ || canvasBoundaryMode_ != CanvasBoundaryMode::Framed)
+    painter.setClipRect(previewClip, Qt::IntersectClip);
+  const bool hasSpotlight = std::any_of(
+      defaultAnnotations.cbegin(), defaultAnnotations.cend(),
+      [](const Annotation &item) {
+        return item.kind == Annotation::Kind::Spotlight;
+      });
+  if (hasSpotlight && !redactionLayer.isNull()) {
+    // Spotlights sample the complete composed canvas. Build that source only
+    // when one is present; a dragged preview may temporarily make it larger
+    // than the settled canvas, so its opening stays live beyond the old edge.
+    const QRectF spotlightCanvas =
+        captureCanvasRect(selection_.size(), defaultAnnotations,
+                          canvasBoundaryMode_);
+    const bool spotlightGrown = spotlightCanvas !=
+                                QRectF(QPointF(), selection_.size());
+    if (grown || spotlightGrown) {
+      const qreal pixelScale = editScale() * devicePixelRatioF();
+      const QSize canvasPixels(
+          std::max(1, qCeil(spotlightCanvas.width() * pixelScale)),
+          std::max(1, qCeil(spotlightCanvas.height() * pixelScale)));
+      defaultLayerSource =
+          QImage(canvasPixels, QImage::Format_ARGB32_Premultiplied);
+      defaultLayerSource.fill(Qt::transparent);
+      QPainter basePainter(&defaultLayerSource);
+      basePainter.setRenderHints(QPainter::SmoothPixmapTransform);
+      const bool automaticSpotlightBackground =
+          canvasBoundaryMode_ == CanvasBoundaryMode::Framed &&
+          spotlightGrown && backgroundStyle_ == BackgroundStyle::None;
+      const BackgroundStyle spotlightBackground =
+          automaticSpotlightBackground ? BackgroundStyle::Slate : background;
+      paintCaptureBackground(basePainter, defaultLayerSource.rect(),
+                             spotlightBackground);
+      const QRectF sourcePixels(-spotlightCanvas.left() * pixelScale,
+                                -spotlightCanvas.top() * pixelScale,
+                                selection_.width() * pixelScale,
+                                selection_.height() * pixelScale);
+      const bool spotlightHasBackground =
+          spotlightBackground != BackgroundStyle::None &&
+          spotlightBackground != BackgroundStyle::Off;
+      if (imageShadow_ && spotlightHasBackground)
+        paintCaptureImageShadow(basePainter, sourcePixels, pixelScale,
+                                pixelScale);
+      basePainter.drawImage(sourcePixels, redactionLayer);
+      basePainter.end();
+      defaultLayerBounds = spotlightCanvas;
+    }
+  }
+  // Default-layer tools (including spotlight) sample the redacted composed
+  // canvas, never the raw capture. Once grown this includes the background,
+  // so a spotlight carried past the old frame has valid pixels to sample.
+  if (!defaultLayerSource.isNull()) {
+    paintDefaultLayer(painter, defaultLayerSource, defaultLayerBounds,
+                      defaultAnnotations);
   } else {
     for (const Annotation &annotation : defaultAnnotations)
       paintAnnotation(painter, annotation);
   }
   painter.restore();
+  if (highlighterPreview_) {
+    const qreal height =
+        highlighterPreviewHeight(highlighterPreview_->annotationSize);
+    const QPointF pointer = toAnnotationPoint(cursor_);
+    paintHighlighterIBeam(
+        painter, QPointF(pointer.x(), dragging_ && highlighterLock_
+                                          ? highlighterPreview_->centerY
+                                          : pointer.y()),
+        height, editScale());
+  }
   if (tool_ == Tool::Select && marqueeSelecting_ &&
       !marqueeRect_.isEmpty()) {
     const qreal scale = std::max<qreal>(editScale(), 0.01);
@@ -5410,26 +6171,19 @@ void CaptureEditor::paintEdit(QPainter &painter) {
       selectedAnnotation_ != editingAnnotation_) {
     const qreal scale = std::max<qreal>(editScale(), 0.01);
     const bool multiple = selectedAnnotations_.size() > 1;
-    const QRectF bounds =
-        (multiple ? selectedAnnotationsBounds()
-                  : annotationBounds(annotations_.at(selectedAnnotation_)))
-            .adjusted(-4, -4, 4, 4);
     // Faint while a wheel adjustment is in flight: the handles sit exactly
     // where the change shows, so at full strength they hide it.
     const qreal chromeOpacity = adjustingSelection_ ? 0.25 : 1.0;
     painter.setOpacity(chromeOpacity);
-    if (multiple ||
+    if (!multiple &&
         showsSelectionBounds(annotations_.at(selectedAnnotation_).kind)) {
-      // The union reads as the group's extent, so draw it faintly and outline
-      // each member on top: otherwise a select-all looks like one box with no
-      // way to tell what is in it, and a flat arrow shows nothing at all.
-      painter.setPen(QPen(QColor(255, 255, 255, multiple ? 110 : 220),
-                          1.0 / scale, Qt::DashLine));
+      const Annotation &selected = annotations_.at(selectedAnnotation_);
+      const QRectF bounds =
+          annotationBounds(selected).adjusted(-4, -4, 4, 4);
+      painter.setPen(
+          QPen(QColor(255, 255, 255, 220), 1.0 / scale, Qt::DashLine));
       painter.setBrush(Qt::NoBrush);
-      const qreal boxRadius =
-          multiple ? 0.0
-                   : selectionBoundsRadius(
-                         annotations_.at(selectedAnnotation_), 4.0);
+      const qreal boxRadius = selectionBoundsRadius(selected, 4.0);
       if (boxRadius > 0.0)
         painter.drawRoundedRect(bounds, boxRadius, boxRadius);
       else
@@ -5439,6 +6193,9 @@ void CaptureEditor::paintEdit(QPainter &painter) {
       painter.setPen(
           QPen(QColor(255, 255, 255, 220), 1.0 / scale, Qt::DashLine));
       painter.setBrush(Qt::NoBrush);
+      // A multi-selection has no synthetic outer object: that reads as if the
+      // whole grown canvas were selected. Outline each actual layer instead,
+      // consistently for Ctrl-click, marquee, and Ctrl+A groups.
       for (const int index : selectedAnnotations_) {
         if (index < 0 || index >= annotations_.size() ||
             index == editingAnnotation_)
@@ -5463,12 +6220,19 @@ void CaptureEditor::paintEdit(QPainter &painter) {
     painter.setOpacity(1.0);
   }
   painter.restore();
-  paintOcrOverlay(painter, image, editScale());
+  paintOcrOverlay(painter, sourceImage, editScale());
 
-  if (tool_ == Tool::Select) {
+  // Screenshot chrome means "crop this source", not "this is another
+  // selected object". Keep it out of the layer-selection state entirely;
+  // clicking empty canvas puts the layers down and brings cropping back.
+  if (tool_ == Tool::Select && selectedAnnotations_.isEmpty()) {
     painter.setPen(QPen(QColor(QStringLiteral("#0a84ff")), 1, Qt::DashLine));
     painter.setBrush(Qt::NoBrush);
     painter.drawRect(image.adjusted(-1, -1, 1, 1));
+    if (grown) {
+      painter.setPen(QPen(QColor(10, 132, 255, 100), 1, Qt::DashLine));
+      painter.drawRect(sourceImage);
+    }
     painter.setPen(QPen(QColor(QStringLiteral("#0a84ff")), 2));
     painter.setBrush(QColor(QStringLiteral("#f5f5f7")));
     for (const QRectF &handle : cropHandleRects())
@@ -5530,9 +6294,9 @@ void CaptureEditor::paintEdit(QPainter &painter) {
                      QPointF(hue.right() + 2, hueY));
   }
 
-  if (textEditor_->isVisible()) {
+  if (textEditing()) {
     // Cream pill under the transparent inline editor, and
-    // a caret spanning the glyph box rather than Neucha's whole line height.
+    // a caret spanning the glyph box rather than the face's whole line height.
     const QRectF box = textEditor_->geometry();
     if (textEditPill_) {
       const qreal radius = std::min(box.height() / 4.0, 6.0);
@@ -5548,7 +6312,10 @@ void CaptureEditor::paintEdit(QPainter &painter) {
       const qreal baseline = cursor.top() + metrics.ascent();
       const qreal top = baseline - metrics.capHeight() * 1.15;
       const qreal bottom = baseline + metrics.descent() * 0.35;
-      painter.setPen(QPen(textColor_, std::max(1.0, box.height() / 18.0)));
+      // Scale the pen to one line, not the widget: the multiline editor grows
+      // taller with every Return, and the caret must not thicken with it.
+      const qreal lineBox = metrics.lineSpacing() + metrics.descent() + 4.0;
+      painter.setPen(QPen(textColor_, std::max(1.0, lineBox / 18.0)));
       painter.drawLine(QPointF(cursor.center().x(), top),
                        QPointF(cursor.center().x(), bottom));
     }
@@ -5561,7 +6328,17 @@ void CaptureEditor::paintEdit(QPainter &painter) {
   buttonFont.setPixelSize(11);
   buttonFont.setBold(true);
   painter.setFont(buttonFont);
-  const QVector<ToolbarButton> buttons = toolbarButtons();
+  QVector<qreal> toolbarDividers;
+  const QVector<ToolbarButton> buttons = toolbarButtons(&toolbarDividers);
+  if (!toolbarDividers.isEmpty()) {
+    const qreal scale = toolbarScale(width());
+    const qreal barHeight = 36 * scale;
+    const qreal barY = toolbarTop();
+    painter.setPen(QPen(QColor(255, 255, 255, 30), 1));
+    for (const qreal dividerX : std::as_const(toolbarDividers))
+      painter.drawLine(QPointF(dividerX, barY + 6),
+                       QPointF(dividerX, barY + barHeight - 6));
+  }
   const ToolbarButton *hoveredButton = nullptr;
   for (const ToolbarButton &button : buttons) {
     const bool selected =
@@ -5644,36 +6421,6 @@ void CaptureEditor::paintEdit(QPainter &painter) {
     painter.drawText(pill, Qt::AlignCenter, QStringLiteral("SCROLL CAPTURE"));
   }
   drawStatusPill(painter, rect(), status_);
-  QVector<QPointF> keepVisible;
-  if (selectedAnnotation_ >= 0 && selectedAnnotation_ < annotations_.size() &&
-      hasEndpointHandles(annotations_.at(selectedAnnotation_).kind)) {
-    const Annotation &selected = annotations_.at(selectedAnnotation_);
-    const qreal scale = editScale();
-    keepVisible = {image.topLeft() + selected.start * scale,
-                   image.topLeft() + selected.end * scale};
-  }
-  drawHotkeyLegend(
-      painter, rect(), cursor_,
-      {{QStringLiteral("V"), QStringLiteral("Select / move layer")},
-       {QStringLiteral("A"), QStringLiteral("Arrow")},
-       {QStringLiteral("L"), QStringLiteral("Line")},
-       {QStringLiteral("F / H"), QStringLiteral("Freehand / Highlighter")},
-       {QStringLiteral("C"), QStringLiteral("Marker")},
-       {QStringLiteral("R / E"), QStringLiteral("Rectangle / Ellipse")},
-       {QStringLiteral("X"), QStringLiteral("Cut out a band")},
-       {QStringLiteral("T"), QStringLiteral("Text")},
-       {QStringLiteral("Double click"), QStringLiteral("Edit text layer")},
-       {QStringLiteral("1–8"), QStringLiteral("Color")},
-       {QStringLiteral("Wheel"), QStringLiteral("Zoom selected / tool size")},
-       {QStringLiteral("D / O"), QStringLiteral("Redact / OCR text")},
-       {QStringLiteral("B / P"), QStringLiteral("Backdrop / Pin on screen")},
-       {QStringLiteral("Ctrl+Z"), QStringLiteral("Undo")},
-       {QStringLiteral("Ctrl+Shift+Z"), QStringLiteral("Redo")},
-       {QStringLiteral("Enter"), QStringLiteral("Copy + save")},
-       {QStringLiteral("Ctrl+C"), QStringLiteral("Copy only")},
-       {QStringLiteral("Ctrl+S"), QStringLiteral("Save only")},
-       {QStringLiteral("Esc"), QStringLiteral("Arrow / twice close")}},
-      keepVisible);
   if (hoveredButton) {
     drawInstantTooltip(painter, rect(), hoveredButton->rect,
                        hoveredButton->tooltip);
@@ -5688,14 +6435,17 @@ void CaptureEditor::paintEdit(QPainter &painter) {
         QString tooltip;
         if (tool_ == Tool::Text) {
           tooltip = QStringLiteral(
-                        "Neucha · S  M  L · current %1 · Scroll wheel · %2 · T "
-                        "again toggles pill")
+                        "%1 · S  M  L · current %2 · Scroll wheel · %3 · T "
+                        "again cycles style · Shift+T cycles font")
+                        .arg(annotationTextFontName(textFont_))
                         .arg(QString::fromLatin1(kTextSizeNames.at(
                             static_cast<std::size_t>(textSizeIndex_))))
                         .arg(textBackgroundName(textBackground_));
         } else if (tool_ == Tool::Redact) {
           tooltip = QStringLiteral("Redact · %1 · D toggles style")
                         .arg(redactionStyleName(redactionStyle_));
+        } else if (tool_ == Tool::Highlighter) {
+          tooltip = highlighterTooltip();
         } else if (tool_ == Tool::Rectangle) {
           tooltip = QStringLiteral("Rectangle · %1 · Size %2 · Scroll wheel · "
                                    "Alt+Wheel %3")
@@ -5720,14 +6470,29 @@ void CaptureEditor::paintEdit(QPainter &painter) {
 
 void CaptureEditor::paintEvent(QPaintEvent *event) {
   Q_UNUSED(event)
+  const bool firstPaint = !firstPaintReported_;
+  if (firstPaint)
+    startupTimingMark("first overlay paint started");
   if (scrollPanel_)
     return; // the panel owns the surface; the page shows through its hole
   QPainter painter(this);
   painter.setRenderHints(QPainter::Antialiasing |
                          QPainter::SmoothPixmapTransform |
                          QPainter::TextAntialiasing);
-  if (phase_ == Phase::Select)
+  switch (phase_) {
+  case Phase::Select:
+  case Phase::Export:
     paintSelect(painter);
-  else
+    break;
+  case Phase::Edit:
     paintEdit(painter);
+    break;
+  }
+  if (firstPaint) {
+    firstPaintReported_ = true;
+    startupTimingMark("first overlay paint completed");
+    QTimer::singleShot(0, this, [] {
+      startupTimingMark("event loop resumed after first paint");
+    });
+  }
 }

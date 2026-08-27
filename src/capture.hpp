@@ -43,12 +43,23 @@ struct CaptureData {
   QVector<WindowTarget> windows;
 };
 
-enum class BackgroundStyle { None, Aurora, Sunset, Lagoon, Violet };
+enum class BackgroundStyle {
+  None,
+  Off,
+  Slate,
+  Aurora,
+  Sunset,
+  Lagoon,
+  Violet,
+  Custom
+};
+enum class CanvasBoundaryMode { Framed, Overflow, Image };
 enum class QuickOutputMode { None, Copy, Save, Both };
 
 enum class SpotlightShape { Ellipse, Rectangle, RoundedRectangle };
 enum class RedactionStyle { Solid, Pixelate };
-enum class TextBackground { Plain, Pill };
+enum class TextBackground { Plain, Pill, Outline };
+enum class TextFont { Neucha, JetBrainsMono, InterDisplay };
 
 struct Annotation {
   enum class Kind {
@@ -79,17 +90,29 @@ struct Annotation {
   SpotlightShape spotlightShape = SpotlightShape::Ellipse;
   quint32 redactionSeed = 0;
   TextBackground textBackground = TextBackground::Pill;
+  /// Typeface is a layer property so reopened and duplicated labels keep it.
+  TextFont textFont = TextFont::Neucha;
   quint64 id = 0;
 
   bool operator==(const Annotation &) const = default;
 };
 
 struct Operation {
-  enum class Type { Crop, Background, Annotate, Patch, Delete, Cut };
+  enum class Type {
+    Crop,
+    Background,
+    CanvasBoundary,
+    Annotate,
+    Patch,
+    Delete,
+    Cut
+  };
 
   Type type = Type::Annotate;
   QRectF crop;
   BackgroundStyle background = BackgroundStyle::None;
+  bool imageShadow = true;
+  CanvasBoundaryMode canvasBoundary = CanvasBoundaryMode::Framed;
   QVector<Annotation> annotations;
   QVector<quint64> ids;
   CutOp cut;
@@ -118,7 +141,11 @@ enum class AnnotationLayer { Redaction, Default };
 }
 
 [[nodiscard]] bool loadCaptureFonts();
-[[nodiscard]] QFont annotationTextFont(qreal size);
+/** User-facing name for a bundled annotation typeface. */
+[[nodiscard]] QString annotationTextFontName(TextFont textFont);
+/** Bundled annotation font at Omasnap's logical text size. */
+[[nodiscard]] QFont annotationTextFont(qreal size,
+                                       TextFont textFont = TextFont::Neucha);
 /**
  * Discovers the focused monitor (name, geometry, scale). Fast: only one
  * `hyprctl monitors` call. Safe to call on the main thread to position the
@@ -140,6 +167,17 @@ enum class AnnotationLayer { Redaction, Default };
 /** Bounds of a text layer's glyph box, or of its readability pill when it
  *  has one; `start` is the baseline origin. */
 [[nodiscard]] QRectF annotationTextBounds(const Annotation &annotation);
+/**
+ * Pixel-aligned annotation space selected by `boundaryMode`. Grow contains
+ * every painted extent, Frame stops at the normal backdrop frame, and Image
+ * stops at the source frame. The source always starts at 0,0; a negative
+ * top/left means background was added before it. Keeping this as a derived
+ * value avoids translating layers or repeatedly copying the source.
+ */
+[[nodiscard]] QRectF
+captureCanvasRect(const QSizeF &sourceFrameSize,
+                  const QVector<Annotation> &annotations,
+                  CanvasBoundaryMode boundaryMode = CanvasBoundaryMode::Framed);
 /** Captures the named output through ext-image-copy-capture. */
 /** A live native capture session for one output (`MonitorInfo::name`, e.g.
  *  "DP-3") over its own Wayland connection: open once, then grab frames
@@ -188,10 +226,25 @@ void describeFileCapture(CaptureData &capture, QImage image,
 /** Returns an upright image for captured Wayland buffer contents. */
 [[nodiscard]] QImage normalizeWaylandCapture(const QImage &image,
                                              std::uint32_t transform);
+/** `customBackdrop` is the image drawn for `BackgroundStyle::Custom`; unused
+ *  (and safe to omit) for every other style. */
 [[nodiscard]] QImage renderCapture(const CaptureData &capture,
                                    const QRectF &selection,
                                    const QVector<Annotation> &annotations,
-                                   BackgroundStyle backgroundStyle);
+                                   BackgroundStyle backgroundStyle,
+                                   bool imageShadow = true,
+                                   CanvasBoundaryMode boundaryMode =
+                                       CanvasBoundaryMode::Framed,
+                                   const QImage &customBackdrop = {});
+/** Lowercase serialization name ("aurora", "custom", ...) for a backdrop
+ *  style, used in the operation log and the `[background] default` config
+ *  key. */
+[[nodiscard]] QString backgroundStyleName(BackgroundStyle style);
+/** Parses a backdrop style from its lowercase config/JSON name ("aurora",
+ *  "custom", ...). Leaves `style` untouched and returns false when `name`
+ *  doesn't match one. */
+[[nodiscard]] bool backgroundStyleFromName(const QString &name,
+                                           BackgroundStyle &style);
 /** Loads the current Wayland clipboard image. */
 [[nodiscard]] bool loadClipboardImage(QImage &image, QString &error);
 [[nodiscard]] bool copyPngFileToClipboard(const QString &path, QString &error);
@@ -212,8 +265,15 @@ void paintSpotlights(QPainter &painter, const QImage &source,
 void paintDefaultLayer(QPainter &painter, const QImage &redacted,
                        const QRectF &logicalBounds,
                        const QVector<Annotation> &annotations);
+/** `customBackdrop` is the image drawn (cover-fit) for
+ *  `BackgroundStyle::Custom`; a null image there paints nothing, same as
+ *  `BackgroundStyle::None`. */
 void paintCaptureBackground(QPainter &painter, const QRectF &bounds,
-                            BackgroundStyle backgroundStyle);
+                            BackgroundStyle backgroundStyle,
+                            const QImage &customBackdrop = {});
+/** Paints the app's soft ambient-plus-key shadow around `imageRect`. */
+void paintCaptureImageShadow(QPainter &painter, const QRectF &imageRect,
+                             qreal scaleX = 1.0, qreal scaleY = 1.0);
 /**
  * Renders the selection region at `targetSize` for the redaction layer. The
  * result carries no annotations; callers overlay redactions with
@@ -261,6 +321,10 @@ void prunePinnedSnapshots();
  * quality knob, which maps inversely onto zlib levels: -1 keeps the default
  * level, higher values compress less and encode faster.
  */
+/** Saves a pinned snapshot plus a sidecar log recording the logical size,
+ *  so editing the pin later reopens at the captured scale. */
+[[nodiscard]] bool savePinnedSnapshot(const QImage &image, const QString &path,
+                                      const QSize &logicalSize, QString &error);
 [[nodiscard]] bool saveTemporarySnapshot(const QImage &image, QString path,
                                          QString &error, int quality = -1);
 [[nodiscard]] QString recognizeText(const QImage &image, QString &error);
