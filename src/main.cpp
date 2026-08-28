@@ -2,6 +2,7 @@
 #include "cli-path.hpp"
 #include "editor.hpp"
 #include "instance-lock.hpp"
+#include "overlay-chrome.hpp"
 #include "pin.hpp"
 #include "recent-snaps.hpp"
 #include "startup-timing.hpp"
@@ -100,9 +101,20 @@ int main(int argc, char **argv) {
   QCoreApplication::setApplicationVersion(QString::fromLatin1(OMASNAP_VERSION));
   QCoreApplication::setOrganizationName(QStringLiteral("Omarchy"));
   qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
+  // Omarchy exports QT_QPA_PLATFORMTHEME=gtk3 session-wide. Honouring it
+  // loads the qgtk3 plugin, which initialises GTK inside this process
+  // (measured 81-112 ms of QApplication construction, plus ~40 MB of RSS)
+  // for a hand-painted overlay that opens no dialogs and reads no palette.
+  // The generic theme is all it needs; the chrome font is pinned in
+  // chromeFont() rather than taken from the theme.
+  qputenv("QT_QPA_PLATFORMTHEME", "");
   QGuiApplication::setDesktopFileName(QStringLiteral("omasnap"));
   QApplication application(argc, argv);
   startupTimingMark("QApplication constructed");
+  // With the platform theme disabled the default font would be Qt's generic
+  // "Sans Serif 9"; pin what the theme used to install before any widget
+  // is created, so painter/widget default-font text keeps its size and face.
+  QApplication::setFont(chromeDefaultFont());
 
   // A stitched scroll capture (or any tall pinned image) exceeds Qt's default
   // 256 MB image-decode allocation limit; lift it so --file/--pin can open it.

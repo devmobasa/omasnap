@@ -43,6 +43,19 @@ Each of these is invoked through the same small `runProcess`/
 worker (see [threading.md](threading.md)) — never inline on the UI thread,
 and always with a timeout.
 
+## Not a dependency: the Qt platform theme
+
+Omarchy exports `QT_QPA_PLATFORMTHEME=gtk3` for the whole session so Qt apps
+match GTK apps. Omasnap overrides it to empty for its own process in `main()`
+before `QApplication` is constructed: honouring it loads the `qgtk3` plugin,
+which initialises GTK3, GLib/GIO and dconf inside the process — measured at
+81–112 ms of `QApplication` construction and ~40 MB of RSS on an Omarchy
+laptop — for an overlay that is hand-painted, opens no dialogs and reads no
+palette. The only thing the theme supplied was the system font family; that
+is pinned in `chromeFont()` / `chromeMonoFont()` (`src/overlay-chrome.cpp`)
+instead. Do not reintroduce a platform theme, `QStyle`, or icon-theme lookup:
+each is a startup cost with nothing in this codebase to spend it on.
+
 ## The one config file
 
 `~/.config/omasnap/omasnap.conf` is optional INI, read with `QSettings`.

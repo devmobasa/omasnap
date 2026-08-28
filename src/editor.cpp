@@ -24,7 +24,6 @@
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
-#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QGuiApplication>
 #include <QKeyEvent>
@@ -492,9 +491,7 @@ void drawInstantTooltip(QPainter &painter, const QRect &bounds,
                         const QRectF &anchor, const QString &text) {
   if (text.isEmpty())
     return;
-  QFont font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
-  font.setPixelSize(12);
-  painter.setFont(font);
+  painter.setFont(chromeFont(12));
   const qreal width = painter.fontMetrics().horizontalAdvance(text) + 20;
   const qreal height = 28;
   qreal x = std::clamp(anchor.center().x() - width / 2.0, 8.0,
@@ -534,10 +531,7 @@ void drawMeasureBadge(QPainter &painter, const QRect &bounds,
                       const QPointF &cursor, const QString &text) {
   if (text.isEmpty())
     return;
-  QFont font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-  font.setPixelSize(12);
-  font.setBold(true);
-  painter.setFont(font);
+  painter.setFont(chromeMonoFont(12, true));
   const qreal width = painter.fontMetrics().horizontalAdvance(text) + 16;
   constexpr qreal height = 22;
   constexpr qreal gap = 15;
@@ -6297,9 +6291,7 @@ void CaptureEditor::paintEdit(QPainter &painter) {
     painter.restore();
 
   const QString currentTool = toolAction(tool_);
-  QFont buttonFont = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
-  buttonFont.setPixelSize(11);
-  buttonFont.setBold(true);
+  const QFont buttonFont = chromeFont(11, true);
   painter.setFont(buttonFont);
   QVector<qreal> toolbarDividers;
   const QVector<ToolbarButton> buttons = toolbarButtons(&toolbarDividers);
@@ -6360,10 +6352,7 @@ void CaptureEditor::paintEdit(QPainter &painter) {
     painter.setPen(QPen(QColor(255, 255, 255, 34), 1));
     painter.setBrush(QColor(22, 22, 28, 248));
     painter.drawRoundedRect(panel, 9, 9);
-    QFont sizeFont = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
-    sizeFont.setPixelSize(11);
-    sizeFont.setBold(true);
-    painter.setFont(sizeFont);
+    painter.setFont(chromeFont(11, true));
     for (int index = 0; index < 3; ++index) {
       const QRectF item(panel.left() + index * 34, panel.top(), 34,
                         panel.height());

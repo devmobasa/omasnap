@@ -65,7 +65,11 @@ change that touches the principle, not just this summary.
 - **Omarchy aesthetics.** `omarchy-notification-send` when available,
   `OMASNAP_OCR_LANGS`/`OMARCHY_OCR_LANGS` fallback for OCR languages,
   minimal vector-drawn icons (no icon-theme dependency), the bundled Neucha
-  font.
+  font. Chrome text uses `chromeFont()`/`chromeMonoFont()`
+  (`src/overlay-chrome.cpp`), pinned in code, and `main()` installs
+  `chromeDefaultFont()` as the application font; the Qt platform theme is
+  deliberately disabled at startup (see [docs/dependencies.md](docs/dependencies.md)),
+  so never reach for `QFontDatabase::systemFont`, `QStyle`, or `palette()`.
 
 ## Repository layout
 

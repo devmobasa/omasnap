@@ -7,6 +7,7 @@
 #include "cut-mapping-smoke.hpp"
 #include "cut-smoke.hpp"
 #include "editor.hpp"
+#include "overlay-chrome.hpp"
 #include "recent-snaps.hpp"
 #include "instance-lock-smoke.hpp"
 #include "palette-config-smoke.hpp"
@@ -713,6 +714,37 @@ void paintTextLikeBand(QImage &image, const QRectF &logicalBand, qreal scale,
 }
 
 /** Local edge scan finds text height across themes and native image scales. */
+// The chrome font is pinned in code (the platform theme is disabled at
+// startup); the general face must resolve to a real family and the mono face
+// to a fixed-pitch one.
+bool runChromeFontCheck(QString &error) {
+  const QFont general = chromeFont(11, true);
+  if (general.pixelSize() != 11 || !general.bold() ||
+      QFontInfo(general).family().isEmpty()) {
+    error = QStringLiteral("chromeFont(11, true) did not resolve: %1")
+                .arg(general.toString());
+    return false;
+  }
+  const QFont mono = chromeMonoFont(12);
+  const QFont appFont = QApplication::font();
+  if (appFont.pointSize() != 11 || QFontInfo(appFont).family().isEmpty() ||
+      appFont.families() != chromeDefaultFont().families()) {
+    error = QStringLiteral("application default font is %1, expected "
+                           "chromeDefaultFont()")
+                .arg(appFont.toString());
+    return false;
+  }
+  const QFontInfo monoInfo(mono);
+  if (mono.pixelSize() != 12 || mono.bold() || monoInfo.family().isEmpty() ||
+      !monoInfo.fixedPitch()) {
+    error = QStringLiteral("chromeMonoFont(12) resolved to %1, expected a "
+                           "fixed-pitch family")
+                .arg(monoInfo.family());
+    return false;
+  }
+  return true;
+}
+
 bool runTextBandDetectionCheck(QString &error) {
   for (const qreal scale : {1.0, 2.0}) {
     const QSize logicalSize(360, 180);
@@ -7378,6 +7410,7 @@ int main(int argc, char **argv) {
     return runInstanceLockHolder(heldLockPath);
 
   QApplication application(argc, argv);
+  QApplication::setFont(chromeDefaultFont()); // as main() does
   if (!loadCaptureFonts())
     return 17;
 
@@ -7449,6 +7482,10 @@ int main(int argc, char **argv) {
   if (!runTextBandDetectionCheck(snapshotError)) {
     qWarning().noquote() << snapshotError;
     return 128;
+  }
+  if (!runChromeFontCheck(snapshotError)) {
+    qWarning().noquote() << snapshotError;
+    return 130;
   }
   if (!runTextAwareHighlighterEditorCheck(application, snapshotError)) {
     qWarning().noquote() << snapshotError;

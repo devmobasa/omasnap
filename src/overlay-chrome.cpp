@@ -2,11 +2,45 @@
 #include "overlay-chrome.hpp"
 
 #include <QFont>
-#include <QFontDatabase>
 #include <QFontMetricsF>
+#include <QString>
+#include <QStringList>
 #include <QPainter>
 
 #include <algorithm>
+
+QFont chromeFont(int pixelSize, bool bold) {
+  static const QFont base = [] {
+    QFont font;
+    font.setFamilies({QStringLiteral("Adwaita Sans"),
+                      QStringLiteral("Noto Sans")});
+    return font;
+  }();
+  QFont font = base;
+  font.setPixelSize(pixelSize);
+  font.setBold(bold);
+  return font;
+}
+
+QFont chromeDefaultFont() {
+  QFont font;
+  font.setFamilies({QStringLiteral("Adwaita Sans"),
+                    QStringLiteral("Noto Sans")});
+  font.setPointSize(11);
+  return font;
+}
+
+QFont chromeMonoFont(int pixelSize, bool bold) {
+  static const QFont base = [] {
+    QFont font;
+    font.setFamilies({QStringLiteral("monospace")});
+    return font;
+  }();
+  QFont font = base;
+  font.setPixelSize(pixelSize);
+  font.setBold(bold);
+  return font;
+}
 
 QString captureTabLabel(CaptureKind kind) {
   switch (kind) {
@@ -139,8 +173,7 @@ void drawHotkeyLegend(QPainter &painter, const QRect &bounds,
                       const QVector<QPair<QString, QString>> &entries) {
   if (entries.isEmpty())
     return;
-  QFont font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
-  font.setPixelSize(11);
+  const QFont font = chromeFont(11);
   const QFontMetricsF metrics(font);
   constexpr qreal keyGap = 10;    // between a key and what it does
   constexpr qreal marginLeft = 14;
