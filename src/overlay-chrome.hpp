@@ -12,7 +12,25 @@
 #include <QString>
 #include <QVector>
 
+class QFont;
 class QPainter;
+
+/// The typeface for overlay chrome text (toolbar labels, hotkey legend,
+/// tooltips): pinned in code, never the platform theme's system font, so
+/// startup does not depend on a theme plugin and the look is the same on
+/// every install. Adwaita Sans is the stock Omarchy UI font; Noto Sans is
+/// the fallback the tab strip already uses.
+[[nodiscard]] QFont chromeFont(int pixelSize, bool bold = false);
+/// The application-wide default font, installed by main() before any widget
+/// exists: the same face and 11 pt size the gtk3 platform theme used to
+/// supply, so text drawn with a painter's or widget's default font (pin
+/// tips, scroll-panel buttons) does not shrink or change family now that
+/// the external desktop theme is bypassed.
+[[nodiscard]] QFont chromeDefaultFont();
+/// Monospace counterpart for numeric readouts: fontconfig's `monospace`
+/// alias, which is what the fixed-font lookup resolved to under every theme
+/// (on Omarchy, the face `omarchy-font-set` chose).
+[[nodiscard]] QFont chromeMonoFont(int pixelSize, bool bold = false);
 
 /// The kinds of capture the tab strip across the top offers, on every
 /// overlay. Region and Window are modes of the area overlay, Scroll is the
