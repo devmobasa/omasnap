@@ -25,7 +25,7 @@ class QPainter;
 /// exists: the same face and 11 pt size the gtk3 platform theme used to
 /// supply, so text drawn with a painter's or widget's default font (pin
 /// tips, scroll-panel buttons) does not shrink or change family now that
-/// the theme is disabled.
+/// the external desktop theme is bypassed.
 [[nodiscard]] QFont chromeDefaultFont();
 /// Monospace counterpart for numeric readouts: fontconfig's `monospace`
 /// alias, which is what the fixed-font lookup resolved to under every theme

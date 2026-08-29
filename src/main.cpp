@@ -105,15 +105,19 @@ int main(int argc, char **argv) {
   // loads the qgtk3 plugin, which initialises GTK inside this process
   // (measured 81-112 ms of QApplication construction, plus ~40 MB of RSS)
   // for a hand-painted overlay that opens no dialogs and reads no palette.
-  // The generic theme is all it needs; the chrome font is pinned in
-  // chromeFont() rather than taken from the theme.
-  qputenv("QT_QPA_PLATFORMTHEME", "");
+  // Qt's built-in generic theme is all it needs, so select it by name
+  // (an empty value would let Qt pick a theme from XDG_CURRENT_DESKTOP
+  // instead). The chrome font is pinned in chromeFont() rather than taken
+  // from the theme. `-platformtheme gtk3` on the command line still
+  // overrides this for debugging.
+  qputenv("QT_QPA_PLATFORMTHEME", "generic");
   QGuiApplication::setDesktopFileName(QStringLiteral("omasnap"));
   QApplication application(argc, argv);
   startupTimingMark("QApplication constructed");
-  // With the platform theme disabled the default font would be Qt's generic
-  // "Sans Serif 9"; pin what the theme used to install before any widget
-  // is created, so painter/widget default-font text keeps its size and face.
+  // With the external desktop theme bypassed, Qt's default font would be
+  // generic "Sans Serif 9"; pin what the theme used to install before any
+  // widget is created, so painter/widget default-font text keeps its size and
+  // face.
   QApplication::setFont(chromeDefaultFont());
 
   // A stitched scroll capture (or any tall pinned image) exceeds Qt's default

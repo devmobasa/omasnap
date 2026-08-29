@@ -3023,10 +3023,10 @@ void CaptureEditor::ensureTextEditor() {
   textEditor_ = new InlineTextEdit(this);
   textEditor_->hide();
   textEditor_->setViewportMargins(0, 0, 0, 0);
-  textEditor_->setStyleSheet(
-      QStringLiteral("QPlainTextEdit { color: #ff375f; background: transparent; "
-                     "border: none; padding: 0;"
-                     " selection-background-color: #0a84ff; }"));
+  textEditor_->setStyleSheet(QStringLiteral(
+      "QPlainTextEdit { color: #ff375f; background: transparent; "
+      "border: none; padding: 0;"
+      " selection-background-color: #0a84ff; selection-color: #ffffff; }"));
   textEditor_->installEventFilter(this);
   connect(textEditor_, &QPlainTextEdit::cursorPositionChanged, this, [this] {
     textCaretOn_ = true;
@@ -3106,9 +3106,10 @@ void CaptureEditor::beginText(const QPointF &point, int annotationIndex,
   textEditPill_ = pill;
   const int pillPad = pill ? qRound(std::max(4.0, metrics.height() * 0.18)) : 0;
   textEditor_->setStyleSheet(
-      QStringLiteral("QPlainTextEdit { color: %1; background: transparent; "
-                     "border: none; margin: 0; padding: 0;"
-                     " selection-background-color: #0a84ff; }")
+      QStringLiteral(
+          "QPlainTextEdit { color: %1; background: transparent; "
+          "border: none; margin: 0; padding: 0;"
+          " selection-background-color: #0a84ff; selection-color: #ffffff; }")
           .arg(textColor_.name()));
   textEditor_->setViewportMargins(pillPad, 0, pillPad, 0);
   textEditor_->setGeometry(qRound(position.x()) - pillPad, qRound(position.y()),
