@@ -50,7 +50,7 @@ match GTK apps. Omasnap overrides it to `generic` (Qt's built-in theme) for
 its own process in `main()` before `QApplication` is constructed: honouring
 the session value loads the `qgtk3` plugin,
 which initialises GTK3, GLib/GIO and dconf inside the process — measured at
-81–112 ms of `QApplication` construction and ~40 MB of RSS on an Omarchy
+81–112 ms of `QApplication` construction and ~20–24 MiB of RSS on an Omarchy
 laptop — for an overlay that is hand-painted, opens no dialogs and reads no
 palette. The only relevant values the external theme supplied were its
 general and fixed fonts; their chrome and application-default replacements

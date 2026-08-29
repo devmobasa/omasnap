@@ -103,8 +103,8 @@ int main(int argc, char **argv) {
   qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
   // Omarchy exports QT_QPA_PLATFORMTHEME=gtk3 session-wide. Honouring it
   // loads the qgtk3 plugin, which initialises GTK inside this process
-  // (measured 81-112 ms of QApplication construction, plus ~40 MB of RSS)
-  // for a hand-painted overlay that opens no dialogs and reads no palette.
+  // (measured 81-112 ms of QApplication construction, plus ~20-24 MiB of
+  // RSS) for a hand-painted overlay that opens no dialogs and reads no palette.
   // Qt's built-in generic theme is all it needs, so select it by name
   // (an empty value would let Qt pick a theme from XDG_CURRENT_DESKTOP
   // instead). The chrome font is pinned in chromeFont() rather than taken
