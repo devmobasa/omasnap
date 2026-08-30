@@ -9,6 +9,7 @@
 #include "editor.hpp"
 #include "overlay-chrome.hpp"
 #include "recent-snaps.hpp"
+#include "scroll-capture-job-smoke.hpp"
 #include "instance-lock-smoke.hpp"
 #include "palette-config-smoke.hpp"
 #include "pin-layout-smoke.hpp"
@@ -7840,6 +7841,10 @@ int main(int argc, char **argv) {
   if (!runStitchChecks()) {
     qWarning().noquote() << QStringLiteral("Stitcher checks failed");
     return 104;
+  }
+  if (!runScrollCaptureJobChecks(snapshotError)) {
+    qWarning().noquote() << snapshotError;
+    return 120;
   }
   if (!runSpotlightWheelSmoke(application, snapshotError)) {
     qWarning().noquote() << snapshotError;

@@ -38,10 +38,25 @@ no user-visible benefit.
 | `tesseract` | OCR text recognition | Only if OCR is used; missing tesseract fails just that action |
 | `omarchy-notification-send` | Capture-finished notifications | No — falls back silently if absent (checked with `command -v` semantics via failed `QProcess::startDetached`) |
 
-Each of these is invoked through the same small `runProcess`/
+Most are invoked through the small `runProcess`/
 `QProcess::startDetached` helpers in `src/capture.cpp`, from a background
 worker (see [threading.md](threading.md)) — never inline on the UI thread,
-and always with a timeout.
+and always with a timeout. The intentional exception is auto-scroll's
+stop-aware `hyprctl input:natural_scroll` probe in `src/scroll-inject.cpp`:
+its native-owner thread uses `posix_spawnp` to create a dedicated process group,
+observes its leader without reaping it, then cleans the group and reaps the
+leader before returning. This preserves the group identity through final
+signalling, including Cancel and helpers that exit before their descendants.
+
+## Optional resource-validation tools
+
+The excluded-by-default `omasnap-scroll-cgroup-check` developer target uses
+`systemd-run`/`systemctl --user` and the cgroup v2 memory controller to enforce
+and read back a resident-memory ceiling. These are validation-only tools: they
+are not used by the application, normal builds, or `make check`. The runner
+preflights the commands, a usable systemd user manager, and the memory
+controller, then exits with a clear diagnostic when the host cannot provide
+the test environment.
 
 ## Not a dependency: external Qt platform themes
 

@@ -9,7 +9,7 @@ process, PNG encoding, network of any kind) runs off it.
 
 ## The pattern
 
-Every background operation in the codebase follows the same shape:
+Qt-managed background operations follow the same shape:
 
 1. Copy the small amount of state the worker needs by value into a lambda
    (`CaptureData`, an image, a path). Qt's implicit sharing makes this
@@ -33,10 +33,29 @@ reading its corresponding worker:
 | `pinWatcher_` | Renders the image for a pinned layer surface |
 | `recentsWatcher_` | Lists and decodes thumbnails for the recents shelf |
 
-`src/scroll-capture.cpp` follows the same rule with a plain `QFuture<void>`:
-the capture loop (grab → crop → classify → accumulate) runs on a worker
-thread so the overlay keeps painting the live page and the mode pills while
-frames come in, however slow the compositor's damage-driven capture is.
+`src/scroll-capture.cpp` follows the same rule with a
+`QFutureWatcher<ScrollCaptureJobResult>`. One serialized job opens the native
+output session, grabs and classifies frames, assembles the stitch, writes any
+debug PNGs, and closes the session on the same worker thread. The UI sends
+plain Done/Cancel/Continue commands through lifetime-owned shared state and
+polls plain status snapshots; it never waits for the job.
+
+Automatic injection has its own joinable owner job. That job detects the
+natural-scroll policy once per capture session, creates the uinput/virtual-
+pointer resources, services every Continue episode, and destroys the native
+resources on the same thread. Before the worker's explicit Done-commit point,
+Cancel stops setup-aware waits before any park, nudge, or wheel event and
+discards assembly plus staged debug files. After that point the result and
+debug publication are committed to Done; a later panel dismissal suppresses
+delivery but is not reported as a cancelled worker result.
+
+The injector is the deliberate native-owner exception to the Qt watcher
+mechanism: `scroll-capture-job.cpp` starts one nested `std::jthread` because its
+uinput descriptor and Wayland objects must be created, used, and destroyed on
+that exact thread. Its stop token is bridged to lifetime-owned command state,
+and the outer `QFutureWatcher<ScrollCaptureJobResult>` remains the only GUI
+completion path. Use this exception only for a native resource whose
+same-thread lifetime cannot be expressed as independent thread-pool tasks.
 
 ## What this buys, concretely
 
@@ -80,31 +99,23 @@ purpose every time, since nothing enforces it automatically.
   shape was easy to reach. Fixed to do the encode+write inside the same
   worker lambda as the render, so the slot only launches the pin process.
 
-## A known violation, not yet fixed
+## Scroll worker ownership
 
-`spawnScrollInjector()` (`src/scroll-inject.cpp`) is called synchronously
-from the UI thread when auto-scroll starts or Continues
-(`ScrollCapturePanel::startCapture`/`continueCapture` in
-`src/scroll-capture.cpp`), and it deliberately probes the injection
-backends before returning — including `hyprctl getoption
-input:natural_scroll`, a subprocess spawn with up to a 2-second
-`waitForFinished`. That's a real, if brief and infrequent (once per
-auto-scroll start, not per frame), block on the UI thread. It hasn't been
-moved to a worker because the auto-scroll injector is the most delicate,
-most recently hardened part of the codebase and depends on live
-Hyprland/Wayland state that the offline smoke suite cannot exercise —
-changing its threading needs a live re-verification pass, not just a
-green `make check`. Fix it the same way as the two cases above
-(`QtConcurrent::run` wrapping the whole call, a small watcher applying the
-result) when you can test it live.
+Scroll capture deliberately uses one longer-lived result job rather than a
+sequence of unrelated thread-pool lambdas. `OutputCapture` wraps live Wayland
+objects, so setup, every grab, finish, and destruction stay in that job. The
+injector is likewise joinable rather than detached. Do not split either
+sequence into fresh `QtConcurrent::run()` calls: the global pool does not
+guarantee that a later call resumes on the native object's owning thread.
 
 ## Adding new work
 
 If you're adding an operation that touches disk, spawns a process, or does
 anything non-trivial with an image, it does not go on the UI thread. Follow
-the six existing watchers as templates — the shape (copy in, run, watch,
-apply) is the same every time, on purpose, so new code doesn't invent a
-seventh way to do it. If a signal needs to fire when the worker is truly
+the existing watchers as templates unless one worker must own a native
+resource for its complete lifetime; in that case, follow the documented scroll
+injector owner job and keep its completion behind the outer watcher. If a
+signal needs to fire when the worker is truly
 finished, remember `QFutureWatcher::finished` is a queued connection: it
 does not race obtaining a "the watcher is running" check made moments
 earlier in the same call.

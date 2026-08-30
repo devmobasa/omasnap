@@ -1,8 +1,6 @@
 /** @fileoverview Manual scroll capture overlay (see scroll-capture.hpp). */
 #include "scroll-capture.hpp"
 
-#include "scroll-inject.hpp"
-
 #include <LayerShellQt/Window>
 
 #include <QtConcurrent/QtConcurrentRun>
@@ -19,39 +17,13 @@
 #include <QWheelEvent>
 #include <QPainter>
 #include <QScreen>
-#include <QThread>
 #include <QTimer>
 #include <QWindow>
 
 #include <algorithm>
-#include <QElapsedTimer>
-
 #include <cmath>
 
 namespace {
-/// Poll cadence of the capture loop.
-constexpr int kCaptureIntervalMs = 100;
-/// How long one grab may wait for the compositor to deliver damage. The loop
-/// runs on a worker thread, so waiting is fine; a static screen simply yields
-/// no frame this round.
-constexpr int kGrabTimeoutMs = 400;
-/// Automatic mode reads the screen until it has stopped changing rather than
-/// after a fixed delay: browsers animate a wheel tick over anything from one
-/// frame to several hundred milliseconds, and a frame taken mid-animation
-/// lands wherever the easing curve happened to be. After a tick the page is
-/// given kMotionWaitMs to start moving at all (no change by then is a real
-/// stationary frame: the end of the page, or a wheel that went elsewhere).
-/// Once it moves, a frame is settled when the next grab times out (no damage
-/// for kSettleGrabMs) or repeats the previous one exactly; kMaxSettleMs caps
-/// that for content that never holds still (video, spinners).
-constexpr int kMotionWaitMs = 700;
-constexpr int kSettleGrabMs = 120;
-constexpr int kMaxSettleMs = 2000;
-/// Fraction of the region an automatic step should travel. Overlap is what
-/// the stitcher aligns on; half the region leaves it plenty at any scroll
-/// speed, and the notch count is fitted to it after the first verified step.
-constexpr double kTargetStepFraction = 0.45;
-constexpr int kMaxNotchesPerTick = 12;
 constexpr int kMinRegion = 32; // logical px
 /// How far outside the region its grips and its draggable border reach. The
 /// region itself has to stay untouched: it is what the capture crops.
@@ -80,104 +52,7 @@ constexpr int kModeButtonWidth = 118;
 constexpr int kModeButtonHeight = 40;
 constexpr int kModeButtonGap = 10;
 
-const char *eventName(stitch::ManualCapture::Event event) {
-  using Event = stitch::ManualCapture::Event;
-  switch (event) {
-  case Event::Blank: return "Blank";
-  case Event::Seeded: return "Seeded";
-  case Event::Kept: return "Kept";
-  case Event::Pending: return "Pending";
-  case Event::Still: return "Still";
-  case Event::PendingDropped: return "PendingDropped";
-  case Event::ReSeeded: return "ReSeeded";
-  case Event::Ambiguous: return "Ambiguous";
-  case Event::Unmatchable: return "Unmatchable";
-  case Event::WrongDirection: return "WrongDirection";
-  case Event::Error: return "Error";
-  case Event::Full: return "Full";
-  }
-  return "?";
-}
 } // namespace
-
-struct ScrollCapturePanel::Worker {
-  explicit Worker(stitch::Axis axis) : session(axis), autoSession(axis) {}
-  OutputCapture output;
-  stitch::ManualCapture session;    // manual mode
-  stitch::AutoCapture autoSession;  // automatic mode
-  QRect regionPhysical;
-  int grabbed = 0;
-  int consecutiveFailures = 0;
-  std::uint64_t lastCycle = 0; // last consumed handshake cycle (auto)
-  QImage firstCrop;
-  QImage lastCrop;
-  QString debugDir;
-  /// Notches per normal automatic tick, fitted to the region once the first
-  /// verified step says how far one notch moves this page.
-  /// Starts at one notch, which overlaps on any page, and is fitted to the
-  /// region once the first verified step says how far one notch moves here.
-  int notchesPerTick = 1;
-  bool notchesFitted = false;
-
-  /// Crop of the region from a full output frame, in the stitcher's format.
-  [[nodiscard]] QImage crop(const QImage &frame) const {
-    return frame.copy(regionPhysical).convertToFormat(QImage::Format_RGBA8888);
-  }
-
-  /// Reads frames until the region has settled after a scroll tick (see the
-  /// kMotionWaitMs block). `before` is the region as it was before the tick;
-  /// null on the first cycle. Returns false only when the session is dead or
-  /// nothing could be grabbed at all; `error` describes it.
-  [[nodiscard]] bool acquireSettledFrame(const QImage &before, QImage &settled,
-                                         QString &error) {
-    QElapsedTimer clock;
-    clock.start();
-    bool moved = before.isNull();
-    QImage last;
-    int failures = 0;
-    while (true) {
-      QImage frame;
-      const bool ok = output.grab(frame, error, moved ? kSettleGrabMs
-                                                       : kSettleGrabMs / 2);
-      if (!ok) {
-        if (output.sessionStopped())
-          return false;
-        if (moved && !last.isNull()) {
-          settled = last; // no damage since the last frame: it is the one
-          return true;
-        }
-        if (!moved && clock.elapsed() >= kMotionWaitMs) {
-          settled = before; // nothing moved: genuinely stationary
-          return true;
-        }
-        if (++failures >= 40) // ~5 s of nothing but failures
-          return false;
-        continue;
-      }
-      failures = 0;
-      const QImage current = crop(frame);
-      if (!moved) {
-        if (current != before) {
-          moved = true;
-        } else if (clock.elapsed() >= kMotionWaitMs) {
-          settled = current;
-          return true;
-        } else {
-          continue;
-        }
-      }
-      if (!last.isNull() && current == last) {
-        settled = current; // two identical frames in a row: settled
-        return true;
-      }
-      last = current;
-      if (clock.elapsed() >= kMaxSettleMs) {
-        settled = current; // never holds still; take what is there
-        return true;
-      }
-    }
-  }
-};
 
 ScrollCapturePanel::ScrollCapturePanel(MonitorInfo monitor,
                                        LayerShellQt::Window *layer,
@@ -188,6 +63,11 @@ ScrollCapturePanel::ScrollCapturePanel(MonitorInfo monitor,
   setAttribute(Qt::WA_TranslucentBackground);
   if (parent)
     setGeometry(parent->rect());
+  workerPollTimer_.setInterval(8);
+  connect(&workerPollTimer_, &QTimer::timeout, this,
+          &ScrollCapturePanel::pollWorker);
+  connect(&workerWatcher_, &QFutureWatcher<ScrollCaptureJobResult>::finished,
+          this, &ScrollCapturePanel::workerFinished);
 }
 
 ScrollCapturePanel::~ScrollCapturePanel() { release(); }
@@ -196,7 +76,7 @@ void ScrollCapturePanel::release() {
   if (released_)
     return;
   released_ = true;
-  stopWorker();
+  requestWorker(ScrollCaptureJobCommand::Cancel);
   // Hand the surface back whole: no hole, keyboard exclusive again.
   if (QWindow *window = surfaceWindow())
     window->setMask(QRegion());
@@ -229,37 +109,12 @@ void ScrollCapturePanel::setStatus(const QString &status, bool warning) {
   update();
 }
 
-void ScrollCapturePanel::postStalled() {
-  // Called from the worker thread when an auto capture stops before the end.
-  QMetaObject::invokeMethod(
-      this,
-      [this] {
-        if (phase_ != Phase::Capturing || mode_ != Mode::Auto)
-          return;
-        autoStalled_ = true;
-        applyInputRegion(); // the row grew by a pill
-        update();
-      },
-      Qt::QueuedConnection);
-}
-
-void ScrollCapturePanel::postStatus(const QString &status, bool warning) {
-  // Called from the worker thread; hop to the UI thread. A queued update can
-  // arrive after Done stopped the worker, and it must not overwrite the
-  // finishing/final status.
-  QMetaObject::invokeMethod(
-      this,
-      [this, status, warning] {
-        if (phase_ == Phase::Capturing)
-          setStatus(status, warning);
-      });
-}
 
 QVector<QRect> ScrollCapturePanel::chromeRects() const {
   QVector<QRect> rects;
   for (const CaptureTab &tab : captureTabLayout(rect()))
     rects.push_back(tab.rect.toAlignedRect());
-  if (phase_ == Phase::Selected) {
+  if (phase_ == Phase::Selected || phase_ == Phase::Preparing) {
     for (int index = 0; index < kModeButtonCount; ++index)
       rects.push_back(modeButtonRect(index));
     rects.push_back(selectedCancelButtonRect());
@@ -281,7 +136,8 @@ void ScrollCapturePanel::applyInputRegion() {
     return;
   // The region is exposed from the moment it is chosen, so the page can be
   // scrolled into place without losing it.
-  if (phase_ != Phase::Capturing && phase_ != Phase::Selected) {
+  if (phase_ != Phase::Capturing && phase_ != Phase::Selected &&
+      phase_ != Phase::Preparing) {
     window->setMask(QRegion()); // whole surface takes input
     return;
   }
@@ -317,22 +173,50 @@ void ScrollCapturePanel::setKeyboardGrab(bool grab) {
 
 // ---- capture -----------------------------------------------------------------
 
+void ScrollCapturePanel::startDelayedCaptureForTest(
+    const int setupDelayMs, const int finishDelayMs, const QImage &result,
+    const std::shared_ptr<std::atomic<int>> &sideEffects,
+    const int cancelDrainDelayMs) {
+  phase_ = Phase::Preparing;
+  workerControl_ = std::make_shared<ScrollCaptureJobControl>();
+  workerRevision_ = 0;
+  workerPollTimer_.start();
+  workerWatcher_.setFuture(QtConcurrent::run(
+      [control = workerControl_, setupDelayMs, finishDelayMs, result,
+       sideEffects, cancelDrainDelayMs] {
+        return runDelayedScrollCaptureJobForTest(
+            control, setupDelayMs, finishDelayMs, result, sideEffects,
+            cancelDrainDelayMs);
+      }));
+}
+
+void ScrollCapturePanel::startCaptureJobForTest(
+    const ScrollCaptureJobSpec &spec) {
+  phase_ = Phase::Preparing;
+  setStatus(QStringLiteral("Preparing scroll capture…"));
+  launchCaptureJob(spec);
+}
+
+void ScrollCapturePanel::launchCaptureJob(const ScrollCaptureJobSpec &spec) {
+  workerControl_ = std::make_shared<ScrollCaptureJobControl>();
+  workerRevision_ = 0;
+  workerPollTimer_.start();
+  workerWatcher_.setFuture(
+      QtConcurrent::run([spec, control = workerControl_] {
+        return runScrollCaptureJob(spec, control);
+      }));
+}
+
 void ScrollCapturePanel::startCapture(Mode mode, stitch::Axis axis) {
   if (region_.width() < kMinRegion || region_.height() < kMinRegion)
     return;
+  if (workerWatcher_.isRunning())
+    return;
   mode_ = mode;
   axis_ = axis;
-  auto worker = std::make_unique<Worker>(axis_);
-  QString error;
-  if (!worker->output.open(monitor_.name, error)) {
-    setStatus(QStringLiteral("Output capture failed: %1").arg(error), true);
-    return;
-  }
-  worker->regionPhysical = regionPhysical().intersected(
-      QRect(QPoint(), worker->output.bufferSize()));
-  worker->debugDir = qEnvironmentVariable("OMASNAP_SCROLL_DEBUG_DIR");
-  worker_ = std::move(worker);
-  phase_ = Phase::Capturing;
+  autoStalled_ = false;
+  pendingMode_.reset();
+  phase_ = Phase::Preparing;
   applyInputRegion();
   // The move puck lives inside the region, so the frame on screen right now
   // still has it. Paint the phase change first and let it be shown: the
@@ -346,340 +230,115 @@ void ScrollCapturePanel::startCapture(Mode mode, stitch::Axis axis) {
   // works. Finish/cancel run off the on-screen buttons (mouse clicks, governed
   // by the input region, not the keyboard).
   setKeyboardGrab(false);
-  stopRequested_ = false;
-  if (mode_ == Mode::Manual) {
-    setStatus(QStringLiteral("Scroll the page · Done stitches it"));
-    // A couple of frames after the repaint above, so the compositor has
-    // presented the puck-less frame before the first grab reads it back.
-    QTimer::singleShot(kChromeSettleMs, this, [this] {
-      if (phase_ != Phase::Capturing)
-        return;
-      workerFuture_ = QtConcurrent::run([this] { captureLoop(); });
-    });
-    return;
-  }
-  // Automatic: the injection worker scrolls one acknowledged tick at a time.
-  injectorStop_ = std::make_shared<std::atomic<bool>>(false);
-  handshake_ = std::make_shared<stitch::CaptureHandshake>();
+  setStatus(QStringLiteral("Preparing scroll capture…"));
+  const QRect physical = regionPhysical();
   const auto [parkX, parkY] = autoScrollParkPoint();
-  setStatus(QStringLiteral("Auto-scrolling… · keep the pointer still · "
-                           "Done stitches it"));
-  // Spawn after this frame's commit so the input-region hole and the released
-  // keyboard land before the pointer warp.
-  QTimer::singleShot(
-      kChromeSettleMs, this,
-      [this, parkX, parkY] {
-        if (phase_ != Phase::Capturing)
-          return;
-        QString spawnError;
-        if (!spawnScrollInjector(injectorStop_, handshake_, parkX, parkY,
-                                 axis_, monitor_.name, spawnError)) {
-          // Fall back to manual capture on the same region and axis.
-          qInfo().noquote()
-              << QStringLiteral("scroll: injector unavailable (%1)").arg(spawnError);
-          mode_ = Mode::Manual;
-          setStatus(QStringLiteral("Auto-scroll unavailable · scroll "
-                                   "manually · Done stitches"),
-                    true);
-          workerFuture_ = QtConcurrent::run([this] { captureLoop(); });
-          return;
-        }
-        workerFuture_ = QtConcurrent::run([this] { autoCaptureLoop(); });
-      });
+  const ScrollCaptureJobSpec spec{
+      monitor_.name,
+      physical,
+      qEnvironmentVariable("OMASNAP_SCROLL_DEBUG_DIR"),
+      mode == Mode::Auto ? ScrollCaptureJobMode::Auto
+                         : ScrollCaptureJobMode::Manual,
+      axis,
+      parkX,
+      parkY,
+      {},
+  };
+  // Wait for the chrome-free frame without blocking the event handler. The
+  // job then opens, uses, and closes its Wayland session on one worker thread.
+  QTimer::singleShot(kChromeSettleMs, this, [this, spec] {
+    if (phase_ != Phase::Preparing || released_)
+      return;
+    launchCaptureJob(spec);
+  });
 }
 
-void ScrollCapturePanel::stopWorker() {
-  stopRequested_ = true;
-  if (injectorStop_)
-    injectorStop_->store(true, std::memory_order_release);
-  if (workerFuture_.isRunning())
-    workerFuture_.waitForFinished();
+void ScrollCapturePanel::requestWorker(const ScrollCaptureJobCommand command) {
+  if (workerControl_)
+    workerControl_->request(command);
 }
 
-void ScrollCapturePanel::captureLoop() {
-  using Event = stitch::ManualCapture::Event;
-  Worker &w = *worker_;
-  QString error;
-  bool captureFull = false;
-  while (!stopRequested_) {
-    QImage frame;
-    if (!w.output.grab(frame, error, kGrabTimeoutMs)) {
-      if (w.output.sessionStopped()) {
-        // The compositor ended the session (output disconnected, mode
-        // change); no retry can succeed. Leave what was captured for Done.
-        postStatus(QStringLiteral("Screen capture stopped · press Done to "
-                                  "stitch what was captured, or Cancel"),
-                   true);
-        break;
-      }
-      // A timeout means a quiet screen; an immediate failure (dead connection,
-      // repeated frame failures) must not busy-spin, so pace the retries and
-      // tell the user if it persists.
-      QThread::msleep(kCaptureIntervalMs);
-      if (++w.consecutiveFailures == 50)
-        postStatus(QStringLiteral("Screen capture is not delivering frames: "
-                                  "%1").arg(error),
-                   true);
-      continue;
-    }
-    w.consecutiveFailures = 0;
-    if (stopRequested_)
-      break;
-    ++w.grabbed;
-    const QImage cropped = frame.copy(w.regionPhysical)
-                               .convertToFormat(QImage::Format_RGBA8888);
-    if (!w.debugDir.isEmpty() && w.grabbed % 8 == 0)
-      cropped.save(w.debugDir + QStringLiteral("/grab-%1-crop.png")
-                                   .arg(w.grabbed, 3, 10, QChar('0')),
-                   "PNG");
-    const bool wasStarted = w.session.started();
-    const stitch::ManualCapture::Outcome out = w.session.feed(cropped);
-    if (!wasStarted && w.session.started())
-      w.firstCrop = cropped;
-    w.lastCrop = cropped;
-    if (!w.debugDir.isEmpty())
-      qInfo().noquote() << QStringLiteral("scroll grab %1: %2 motion=%3(%4) err=%5 conf=%6 kept=%7 pending=%8")
-                               .arg(w.grabbed).arg(QString::fromLatin1(eventName(out.event)))
-                               .arg(static_cast<int>(out.estimate.motion.kind))
-                               .arg(out.estimate.motion.delta)
-                               .arg(out.estimate.error, 0, 'f', 2)
-                               .arg(out.estimate.confidence, 0, 'f', 2)
-                               .arg(out.keptFrames).arg(out.pendingDelta);
-    const QString frames = QStringLiteral("%1 frame%2")
-                               .arg(out.keptFrames)
-                               .arg(out.keptFrames == 1 ? QString() : QStringLiteral("s"));
-    switch (out.event) {
-    case Event::Blank:
-      if (!out.error.isEmpty())
-        postStatus(QStringLiteral("Capture shows only a solid color · "
-                                  "Cancel and select a different region"),
-                   true);
-      break;
-    case Event::Seeded:
-      postStatus(QStringLiteral("Capturing · 1 frame · scroll the page · Done when finished"));
-      break;
-    case Event::Kept:
-    case Event::Pending:
-    case Event::PendingDropped:
-      // Past the advisory edge the capture keeps going; say so plainly and
-      // keep saying it, rather than firing an alert that the editor then
-      // contradicts by opening the result perfectly well.
-      postStatus(QStringLiteral("Capturing · %1%2 · Done when finished")
-                     .arg(frames)
-                     .arg(w.session.exceedsWidelyOpenableEdge()
-                              ? QStringLiteral(" · very long: fine here, "
-                                               "some apps may not open it")
-                              : QString()));
-      break;
-    case Event::Still:
-      break;
-    case Event::ReSeeded:
-      postStatus(QStringLiteral("Capturing · restarted from here (content changed in place) · scroll the page"));
-      break;
-    case Event::Ambiguous:
-      postStatus(QStringLiteral("Repeated content · keep scrolling to a distinctive part"), true);
-      break;
-    case Event::Unmatchable:
-      postStatus(QStringLiteral("Can't align · scroll back a little; moving content (video) can't be captured"), true);
-      break;
-    case Event::WrongDirection:
-      postStatus(QStringLiteral("Scroll the other way to continue this capture (or Done to stitch what you have)"), true);
-      break;
-    case Event::Error:
-      postStatus(QStringLiteral("Could not add frame: %1").arg(out.error), true);
-      break;
-    case Event::Full:
-      // A designed limit. Stop like a finished capture rather than refusing a
-      // frame every tick: what was captured is intact and Done stitches it.
-      postStatus(QStringLiteral("Capture is as long as it can get · press Done "
-                                "to stitch it, or Cancel"),
-                 true);
-      captureFull = true;
-      break;
-    }
-    if (captureFull)
-      break;
-    QThread::msleep(kCaptureIntervalMs);
+void ScrollCapturePanel::pollWorker() {
+  if (!workerControl_)
+    return;
+  const ScrollCaptureJobSnapshot snapshot = workerControl_->snapshot();
+  if (snapshot.revision == workerRevision_)
+    return;
+  workerRevision_ = snapshot.revision;
+  if (phase_ == Phase::Preparing &&
+      (snapshot.stage == ScrollCaptureJobStage::Capturing ||
+       snapshot.stage == ScrollCaptureJobStage::Stalled))
+    phase_ = Phase::Capturing;
+  const bool stalledChanged = autoStalled_ != snapshot.autoStalled;
+  autoStalled_ = snapshot.autoStalled;
+  if (stalledChanged)
+    applyInputRegion();
+  if (!snapshot.status.isEmpty() &&
+      (phase_ == Phase::Preparing || phase_ == Phase::Capturing ||
+       (phase_ == Phase::Finishing &&
+        snapshot.status == QStringLiteral("Stitching…"))))
+    setStatus(snapshot.status, snapshot.warning);
+  update();
+}
+
+void ScrollCapturePanel::workerFinished() {
+  workerPollTimer_.stop();
+  pollWorker();
+  ScrollCaptureJobResult result;
+  try {
+    result = workerWatcher_.result();
+  } catch (...) {
+    result.completion = ScrollCaptureJobCompletion::Failed;
+    result.error = QStringLiteral("Scroll capture worker failed unexpectedly");
   }
-}
-
-void ScrollCapturePanel::autoCaptureLoop() {
-  using Event = stitch::AutoCapture::Event;
-  using Ack = stitch::AutoCapture::Ack;
-  Worker &w = *worker_;
-  QString error;
-  while (!stopRequested_) {
-    if (injectorStop_->load(std::memory_order_acquire) &&
-        !w.autoSession.reachedEnd() && !w.autoSession.halted()) {
-      postStatus(QStringLiteral("Auto-scroll stopped · Continue picks it back "
-                                "up, Done stitches it"),
-                 true);
-      postStalled();
-      break;
+  workerControl_.reset();
+  if (released_ || phase_ == Phase::Finished)
+    return;
+  switch (result.completion) {
+  case ScrollCaptureJobCompletion::Done:
+    if (result.unverifiedSeams > 0)
+      qWarning().noquote()
+          << QStringLiteral("scroll: capture may contain %1 repeated or missing "
+                            "section(s)")
+                 .arg(result.unverifiedSeams);
+    qInfo().noquote() << QStringLiteral("scroll: stitched %1 frames into %2x%3")
+                             .arg(result.keptFrames)
+                             .arg(result.image.width())
+                             .arg(result.image.height());
+    phase_ = Phase::Finished;
+    emit stitched(result.image);
+    return;
+  case ScrollCaptureJobCompletion::Back:
+    phase_ = Phase::Selected;
+    enterSelected();
+    if (pendingMode_) {
+      const Mode mode = *pendingMode_;
+      pendingMode_.reset();
+      startCapture(mode, axis_);
     }
-    const std::uint64_t cycle = handshake_->readyCycle();
-    if (cycle == 0 || cycle == w.lastCycle) {
-      QThread::msleep(20);
-      continue;
-    }
-    QImage cropped;
-    if (!w.acquireSettledFrame(w.lastCrop, cropped, error)) {
-      // Never acknowledge on a failed grab: the worker holds this cycle and
-      // the same stable screen is retried.
-      if (w.output.sessionStopped()) {
-        postStatus(QStringLiteral("Screen capture stopped · Done stitches "
-                                  "what was captured"),
-                   true);
-        break;
-      }
-      if (++w.consecutiveFailures >= 3)
-        postStatus(QStringLiteral("Screen capture is failing: %1").arg(error),
-                   true);
-      QThread::msleep(20);
-      continue;
-    }
-    w.consecutiveFailures = 0;
-    ++w.grabbed;
-    if (!w.debugDir.isEmpty())
-      cropped.save(w.debugDir + QStringLiteral("/grab-%1-crop.png")
-                                   .arg(w.grabbed, 3, 10, QChar('0')),
-                   "PNG");
-    const stitch::AutoCapture::Outcome out = w.autoSession.feed(cropped);
-    if (!w.firstCrop.isNull() || out.event == Event::Seeded)
-      w.lastCrop = cropped;
-    if (out.event == Event::Seeded)
-      w.firstCrop = cropped;
-    qInfo().noquote() << QStringLiteral("auto grab %1 cycle %2: event=%3 ack=%4 "
-                                        "delta=%5/%6/%7 halt=%8 kept=%9 "
-                                        "notches=%10")
-                             .arg(w.grabbed)
-                             .arg(cycle)
-                             .arg(static_cast<int>(out.event))
-                             .arg(static_cast<int>(out.ack))
-                             .arg(out.estimate.motion.delta)
-                             .arg(out.firstDelta)
-                             .arg(out.secondDelta)
-                             .arg(static_cast<int>(out.haltReason))
-                             .arg(w.autoSession.keptFrames())
-                             .arg(w.notchesPerTick);
-    if (out.event == Event::Blank) {
-      // Not consumed: retry the same cycle once the overlay's paint settles.
-      QThread::msleep(20);
-      continue;
-    }
-    w.lastCycle = cycle;
-    // Fit the step to the page after the first verified forward step: one
-    // notch moves a different distance in every application (and with every
-    // scroll_factor), and the stitcher needs the frames to overlap by about
-    // half whatever that turns out to be.
-    // A verified step arrives as Appended (its delta in the estimate) or,
-    // after a probe, as Committed (first tick then the one-notch probe: the
-    // probe is the cleaner per-notch figure).
-    double perNotch = 0.0;
-    if (out.event == Event::Appended && out.estimate.motion.delta > 0)
-      perNotch = static_cast<double>(out.estimate.motion.delta) / w.notchesPerTick;
-    else if (out.event == Event::Committed && out.secondDelta > 0)
-      perNotch = out.secondDelta / static_cast<double>(stitch::kProbeNotches);
-    else if (out.event == Event::Committed && out.firstDelta > 0)
-      perNotch = static_cast<double>(out.firstDelta) / w.notchesPerTick;
-    if (!w.notchesFitted && perNotch > 0.0) {
-      const int extent = axis_ == stitch::Axis::Vertical
-                             ? w.regionPhysical.height()
-                             : w.regionPhysical.width();
-      const int fitted = static_cast<int>(
-          std::lround(extent * kTargetStepFraction / std::max(perNotch, 1.0)));
-      w.notchesPerTick = std::clamp(fitted, 1, kMaxNotchesPerTick);
-      w.notchesFitted = true;
-      qInfo().noquote() << QStringLiteral("auto: %1 px per notch, region %2 px, "
-                                          "%3 notches per tick from here")
-                               .arg(perNotch, 0, 'f', 1)
-                               .arg(extent)
-                               .arg(w.notchesPerTick);
-    }
-    switch (out.ack) {
-    case Ack::Normal:
-      handshake_->acknowledgeWithNotches(cycle, w.notchesPerTick);
-      break;
-    case Ack::Probe:
-      handshake_->acknowledgeWithNotches(cycle, 1);
-      break;
-    case Ack::Hold:
-      break;
-    }
-    switch (out.event) {
-    case Event::Seeded:
-    case Event::Appended:
-    case Event::Committed:
-      postStatus(QStringLiteral("Auto-scrolling · %1 frame%2%3 · Done stitches")
-                     .arg(w.autoSession.keptFrames())
-                     .arg(w.autoSession.keptFrames() == 1 ? QString()
-                                                          : QStringLiteral("s"))
-                     .arg(w.autoSession.exceedsWidelyOpenableEdge()
-                              ? QStringLiteral(" · very long: fine here, "
-                                               "some apps may not open it")
-                              : QString()));
-      break;
-    case Event::ProbeStarted:
-    case Event::ProbeAgain:
-      postStatus(QStringLiteral("Verifying scroll alignment…"));
-      break;
-    case Event::StillOnce:
-      postStatus(QStringLiteral("Confirming end of content…"));
-      break;
-    case Event::ReachedEnd:
-    case Event::ReachedEndAtSeam:
-      // A page that ended and a page that stopped moving because the pointer
-      // left the frame look the same from here, so this offers Continue
-      // either way: on a real end it simply concludes again.
-      injectorStop_->store(true, std::memory_order_release);
-      postStatus(QStringLiteral("End reached · %1 frames · Continue carries "
-                                "on, Done stitches it")
-                     .arg(w.autoSession.keptFrames()));
-      postStalled();
-      return;
-    case Event::Paused:
-      // Keep only verified content and hand control back. What is verified
-      // stays in the session, so Continue can pick it up from wherever the
-      // page is now.
-      injectorStop_->store(true, std::memory_order_release);
-      w.autoSession.abandonPause();
-      postStatus(QStringLiteral("Auto-scroll paused: capture lost alignment · "
-                                "Continue tries again, Done stitches what was "
-                                "verified"),
-                 true);
-      postStalled();
-      return;
-    case Event::Halted: {
-      injectorStop_->store(true, std::memory_order_release);
-      QString reason;
-      switch (out.haltReason) {
-      case stitch::AutoCapture::HaltReason::LostAlignment:
-        reason = QStringLiteral("Stopped: capture lost alignment");
-        break;
-      case stitch::AutoCapture::HaltReason::MovedBackward:
-        reason = QStringLiteral("Stopped: content moved backward");
-        break;
-      case stitch::AutoCapture::HaltReason::Unmatchable:
-        reason = QStringLiteral("Stopped: retry with slower scrolling");
-        break;
-      case stitch::AutoCapture::HaltReason::BlankFrames:
-        reason = QStringLiteral("Capture shows only a solid color: retry");
-        break;
-      case stitch::AutoCapture::HaltReason::ReachedLimit:
-        reason = QStringLiteral("Capture is as long as it can get");
-        break;
-      default:
-        reason = QStringLiteral("Capture failed: %1").arg(out.error);
-        break;
-      }
-      postStatus(reason + QStringLiteral(" · Done stitches what was captured"),
-                 true);
-      return;
-    }
-    case Event::Blank:
-      break;
-    }
-    QThread::msleep(20);
+    return;
+  case ScrollCaptureJobCompletion::SetupFailed:
+    phase_ = Phase::Selected;
+    applyInputRegion();
+    setStatus(QStringLiteral("Output capture failed: %1").arg(result.error),
+              true);
+    update();
+    return;
+  case ScrollCaptureJobCompletion::Failed:
+    phase_ = Phase::Selected;
+    autoStalled_ = false;
+    applyInputRegion();
+    setStatus(result.error.isEmpty()
+                  ? QStringLiteral("Scroll capture failed")
+                  : result.error,
+              true);
+    update();
+    return;
+  case ScrollCaptureJobCompletion::NoFrames:
+  case ScrollCaptureJobCompletion::Cancelled:
+    phase_ = Phase::Finished;
+    emit dismissed();
+    return;
   }
 }
 
@@ -688,48 +347,7 @@ void ScrollCapturePanel::finishCapture() {
     return;
   phase_ = Phase::Finishing;
   setStatus(QStringLiteral("Stitching…"));
-  stopWorker();
-  Worker &w = *worker_;
-  QString error;
-  const bool started =
-      mode_ == Mode::Auto ? w.autoSession.started() : w.session.started();
-  if (!started) {
-    cancel();
-    return;
-  }
-  QImage assembled = mode_ == Mode::Auto ? w.autoSession.finish(error)
-                                        : w.session.finish(error);
-  if (assembled.isNull()) {
-    phase_ = Phase::Capturing;
-    setStatus(QStringLiteral("Stitch failed: %1").arg(error), true);
-    // The worker's state is intact; restart the (manual) loop so the user can
-    // continue, since an auto capture that failed to stitch has already
-    // stopped.
-    if (mode_ == Mode::Manual) {
-      stopRequested_ = false;
-      workerFuture_ = QtConcurrent::run([this] { captureLoop(); });
-    }
-    return;
-  }
-  if (mode_ == Mode::Auto && w.autoSession.unverifiedSeams() > 0)
-    qWarning().noquote()
-        << QStringLiteral("scroll: capture may contain %1 repeated or missing "
-                          "section(s)")
-               .arg(w.autoSession.unverifiedSeams());
-  const QImage result = assembled.convertToFormat(QImage::Format_ARGB32);
-  if (!w.debugDir.isEmpty()) {
-    result.save(w.debugDir + QStringLiteral("/scroll-stitched.png"), "PNG");
-    if (!w.firstCrop.isNull())
-      w.firstCrop.save(w.debugDir + QStringLiteral("/scroll-first-frame.png"), "PNG");
-    if (!w.lastCrop.isNull())
-      w.lastCrop.save(w.debugDir + QStringLiteral("/scroll-last-frame.png"), "PNG");
-  }
-  const int kept = mode_ == Mode::Auto ? w.autoSession.keptFrames()
-                                       : w.session.keptFrames();
-  qInfo().noquote() << QStringLiteral("scroll: stitched %1 frames into %2x%3")
-                           .arg(kept).arg(result.width()).arg(result.height());
-  phase_ = Phase::Finished;
-  emit stitched(result);
+  requestWorker(ScrollCaptureJobCommand::Done);
 }
 
 void ScrollCapturePanel::switchMode(Mode mode) {
@@ -739,16 +357,13 @@ void ScrollCapturePanel::switchMode(Mode mode) {
     startCapture(mode, axis_);
     return;
   }
-  if (phase_ != Phase::Capturing || mode == mode_)
+  if ((phase_ != Phase::Preparing && phase_ != Phase::Capturing) ||
+      mode == mode_)
     return;
-  const stitch::Axis axis = axis_;
-  stopWorker();
-  worker_.reset();
-  injectorStop_.reset();
-  handshake_.reset();
-  stopRequested_ = false;
-  phase_ = Phase::Selected;
-  startCapture(mode, axis);
+  pendingMode_ = mode;
+  phase_ = Phase::Finishing;
+  setStatus(QStringLiteral("Changing scroll mode…"));
+  requestWorker(ScrollCaptureJobCommand::Back);
 }
 
 std::pair<int, int> ScrollCapturePanel::autoScrollParkPoint() const {
@@ -769,55 +384,33 @@ void ScrollCapturePanel::continueCapture() {
   // has, so this carries on from the last one rather than starting a second
   // capture of the same page. The fresh injector parks the pointer back
   // inside the frame.
-  if (phase_ != Phase::Capturing || !worker_ || mode_ != Mode::Auto)
+  if (phase_ != Phase::Capturing || !workerControl_ || mode_ != Mode::Auto ||
+      !autoStalled_)
     return;
   autoStalled_ = false;
-  stopRequested_ = false;
   // Pressing Continue means the pointer was on our chrome, which is where we
   // hold the keyboard, and Hyprland pins pointer focus to a layer that holds
   // it, so the injected wheel would land on us instead of the page. Let it go
   // before parking the pointer back inside the frame.
   setKeyboardGrab(false);
-  worker_->autoSession.resumeFromEnd(); // a stop looks just like an end
-  worker_->lastCycle = 0; // a new handshake counts from one again
-  injectorStop_ = std::make_shared<std::atomic<bool>>(false);
-  handshake_ = std::make_shared<stitch::CaptureHandshake>();
-  const auto [parkX, parkY] = autoScrollParkPoint();
-  setStatus(QStringLiteral("Auto-scrolling… · keep the pointer still · "
-                           "Done stitches it"));
+  setStatus(QStringLiteral("Preparing auto-scroll…"));
   update();
-  QString spawnError;
-  if (!spawnScrollInjector(injectorStop_, handshake_, parkX, parkY, axis_,
-                           monitor_.name, spawnError)) {
-    autoStalled_ = true;
-    setStatus(QStringLiteral("Could not start auto-scroll again: %1")
-                  .arg(spawnError),
-              true);
-    return;
-  }
-  workerFuture_ = QtConcurrent::run([this] { autoCaptureLoop(); });
+  requestWorker(ScrollCaptureJobCommand::Continue);
 }
 
 void ScrollCapturePanel::returnToModeChoice() {
   // Throw the frames away and go back to the mode row with the region intact.
-  if (phase_ != Phase::Capturing)
+  if (phase_ != Phase::Preparing && phase_ != Phase::Capturing)
     return;
-  stopWorker();
-  worker_.reset();
-  injectorStop_.reset();
-  handshake_.reset();
-  stopRequested_ = false;
-  phase_ = Phase::Selected;
-  applyInputRegion();
-  setKeyboardGrab(false);
-  setStatus(QStringLiteral("The page inside is live · scroll it into position, "
-                           "then choose a mode"));
-  update();
+  phase_ = Phase::Finishing;
+  setStatus(QStringLiteral("Stopping scroll capture…"));
+  requestWorker(ScrollCaptureJobCommand::Back);
 }
 
 void ScrollCapturePanel::cancel() {
-  stopWorker();
+  requestWorker(ScrollCaptureJobCommand::Cancel);
   phase_ = Phase::Finished;
+  hide();
   emit dismissed();
 }
 
@@ -1021,7 +614,7 @@ void ScrollCapturePanel::paintEvent(QPaintEvent *) {
 
     // Grips live in the band outside the region: that rectangle is the
     // capture, so anything drawn inside it would be captured.
-    if (phase_ == Phase::Selected) {
+    if (phase_ == Phase::Selected || phase_ == Phase::Preparing) {
       const int thickness = 4;
       painter.setPen(Qt::NoPen);
       painter.setBrush(QColor(255, 255, 255, 235));
@@ -1056,13 +649,15 @@ void ScrollCapturePanel::paintEvent(QPaintEvent *) {
     buttonFont.setPixelSize(15);
     buttonFont.setBold(true);
     painter.setFont(buttonFont);
-    if (phase_ == Phase::Selected) {
+    if (phase_ == Phase::Selected || phase_ == Phase::Preparing) {
       for (int index = 0; index < kModeButtonCount; ++index) {
         const QRect button = modeButtonRect(index);
         painter.setPen(Qt::NoPen);
-        painter.setBrush(kModeButtons[index].automatic
-                             ? kAccent
-                             : QColor(40, 40, 48, 240));
+        painter.setBrush(phase_ == Phase::Preparing
+                             ? QColor(40, 40, 48, 160)
+                             : kModeButtons[index].automatic
+                                   ? kAccent
+                                   : QColor(40, 40, 48, 240));
         painter.drawRoundedRect(button, 8, 8);
         painter.setPen(Qt::white);
         painter.drawText(button, Qt::AlignCenter,
@@ -1078,15 +673,19 @@ void ScrollCapturePanel::paintEvent(QPaintEvent *) {
       const QRect done = doneButtonRect();
       const QRect backRect = backButtonRect();
       const QRect cancelRect = cancelButtonRect();
+      const bool finishing = phase_ == Phase::Finishing;
       painter.setPen(Qt::NoPen);
-      painter.setBrush(kAccent);
+      painter.setBrush(finishing ? QColor(90, 74, 70, 120) : kAccent);
       painter.drawRoundedRect(done, 8, 8);
-      painter.setBrush(QColor(40, 40, 48, 240));
+      painter.setBrush(finishing ? QColor(40, 40, 48, 120)
+                                 : QColor(40, 40, 48, 240));
       painter.drawRoundedRect(backRect, 8, 8);
+      painter.setBrush(QColor(40, 40, 48, 240));
       painter.drawRoundedRect(cancelRect, 8, 8);
-      painter.setPen(Qt::white);
+      painter.setPen(finishing ? QColor(170, 170, 175) : Qt::white);
       painter.drawText(done, Qt::AlignCenter, QStringLiteral("Done · stitch"));
       painter.drawText(backRect, Qt::AlignCenter, QStringLiteral("Back"));
+      painter.setPen(Qt::white);
       painter.drawText(cancelRect, Qt::AlignCenter, QStringLiteral("Cancel"));
       if (autoStalled_) {
         const QRect resume = continueButtonRect();
@@ -1110,7 +709,7 @@ void ScrollCapturePanel::wheelEvent(QWheelEvent *event) {
   // own chrome. Log it (debug runs), during capture a wheel event arriving with
   // the pointer inside the region would mean the input-region hole is not in
   // effect.
-  if (worker_ && !worker_->debugDir.isEmpty())
+  if (!qEnvironmentVariableIsEmpty("OMASNAP_SCROLL_DEBUG_DIR"))
     qInfo().noquote() << QStringLiteral("scroll: overlay wheel at %1,%2 phase=%3")
                              .arg(event->position().x())
                              .arg(event->position().y())
@@ -1120,7 +719,7 @@ void ScrollCapturePanel::wheelEvent(QWheelEvent *event) {
 
 void ScrollCapturePanel::enterEvent(QEnterEvent *event) {
   updateKeyboardZone(event->position().toPoint());
-  if (worker_ && !worker_->debugDir.isEmpty())
+  if (!qEnvironmentVariableIsEmpty("OMASNAP_SCROLL_DEBUG_DIR"))
     qInfo().noquote() << QStringLiteral("scroll: pointer entered overlay at %1,%2")
                              .arg(event->position().x())
                              .arg(event->position().y());
@@ -1132,7 +731,7 @@ void ScrollCapturePanel::leaveEvent(QEvent *event) {
   // screen. Either way it is not on our chrome, so the keyboard goes back to
   // whatever is under it and the page can be scrolled again.
   setKeyboardGrab(false);
-  if (worker_ && !worker_->debugDir.isEmpty())
+  if (!qEnvironmentVariableIsEmpty("OMASNAP_SCROLL_DEBUG_DIR"))
     qInfo().noquote() << QStringLiteral("scroll: pointer left overlay");
   QWidget::leaveEvent(event);
 }
@@ -1148,8 +747,9 @@ void ScrollCapturePanel::mousePressEvent(QMouseEvent *event) {
       tab >= 0) {
     const CaptureKind kind = captureTabLayout(rect()).at(tab).kind;
     if (kind != CaptureKind::Scroll) {
-      stopWorker();
+      requestWorker(ScrollCaptureJobCommand::Cancel);
       phase_ = Phase::Finished;
+      hide();
       emit tabRequested(kind);
     }
     return;
@@ -1166,12 +766,19 @@ void ScrollCapturePanel::mousePressEvent(QMouseEvent *event) {
       cancel();
     return; // clicks elsewhere in the chrome do nothing
   }
-  if (phase_ == Phase::Selected) {
+  if (phase_ == Phase::Finishing) {
+    if (cancelButtonRect().contains(event->position().toPoint()))
+      cancel();
+    return;
+  }
+  if (phase_ == Phase::Selected || phase_ == Phase::Preparing) {
     const QPoint point = event->position().toPoint();
     if (selectedCancelButtonRect().contains(point)) {
       cancel();
       return;
     }
+    if (phase_ == Phase::Preparing)
+      return;
     const int mode = modeButtonAt(point);
     if (mode >= 0) {
       startCapture(kModeButtons[mode].automatic ? Mode::Auto : Mode::Manual,
@@ -1196,9 +803,7 @@ void ScrollCapturePanel::mousePressEvent(QMouseEvent *event) {
     }
     // Anywhere else, that is, anywhere on the chrome, asks for a fresh
     // region: the editor's own selection takes it from here.
-    stopWorker();
-    phase_ = Phase::Finished;
-    emit dismissed();
+    cancel();
     return;
   }
 }

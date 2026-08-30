@@ -68,6 +68,8 @@ add_library(omasnap-core STATIC
   src/auto-capture.hpp
   src/scroll-capture.cpp
   src/scroll-capture.hpp
+  src/scroll-capture-job.cpp
+  src/scroll-capture-job.hpp
   src/scroll-inject.cpp
   src/scroll-inject.hpp
   src/startup-timing.cpp
@@ -169,6 +171,8 @@ qt_add_executable(omasnap-smoke
   src/auto-capture.hpp
   tests/stitch-smoke.cpp
   tests/stitch-smoke.hpp
+  tests/scroll-capture-job-smoke.cpp
+  tests/scroll-capture-job-smoke.hpp
 )
 target_include_directories(omasnap-smoke PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/tests"
@@ -191,6 +195,24 @@ target_include_directories(stitch-replay PRIVATE
 target_compile_features(stitch-replay PRIVATE cxx_std_23)
 target_compile_options(stitch-replay PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(stitch-replay PRIVATE Qt6::Core Qt6::Gui)
+
+qt_add_executable(omasnap-scroll-performance-benchmark EXCLUDE_FROM_ALL
+  tests/scroll-performance-benchmark.cpp
+)
+target_compile_options(omasnap-scroll-performance-benchmark PRIVATE
+  -Wall -Wextra -Wpedantic
+)
+target_link_libraries(omasnap-scroll-performance-benchmark PRIVATE omasnap-core)
+target_precompile_headers(omasnap-scroll-performance-benchmark REUSE_FROM
+  omasnap-core
+)
+add_custom_target(omasnap-scroll-cgroup-check
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tests/run-scroll-cgroup-check.sh"
+          "$<TARGET_FILE:omasnap-scroll-performance-benchmark>"
+  DEPENDS omasnap-scroll-performance-benchmark
+  USES_TERMINAL
+  VERBATIM
+)
 
 install(TARGETS omasnap
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"

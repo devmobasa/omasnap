@@ -203,7 +203,13 @@ public:
   [[nodiscard]] bool sessionStopped() const;
   /** Pixel size the compositor announced for frames (empty until open). */
   [[nodiscard]] QSize bufferSize() const;
+  /** Bytes retained by the reusable Wayland SHM mapping. */
+  [[nodiscard]] long long mappedBytes() const;
   void close();
+  /// Headless production-startup test seam: `open()` completes after `delayMs`
+  /// with an inert mapping of `size`, avoiding a compositor dependency.
+  static void setOpenTestDoubleForTest(const QSize &size, int delayMs);
+  static void clearOpenTestDoubleForTest();
 
 private:
   struct State;

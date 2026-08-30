@@ -74,11 +74,11 @@ struct AutoProbeDecision {
   enum class Kind { Commit, ProbeAgain, End, Pause };
   enum class PauseReason { StillAmbiguous, Stationary };
   Kind kind = Kind::ProbeAgain;
-  ForwardMatchPath path;                          // Commit
-  bool periodic = false;                          // Commit via known-forward
+  ForwardMatchPath path;                             // Commit
+  bool periodic = false;                             // Commit via known-forward
   std::optional<ForwardMatchCandidate> endCandidate; // End
   PauseReason pauseReason = PauseReason::StillAmbiguous; // Pause
-  std::optional<ForwardMatchPath> bestEffort;     // Pause
+  std::optional<ForwardMatchPath> bestEffort;            // Pause
 };
 [[nodiscard]] AutoProbeDecision
 autoProbeDecision(const ForwardLookaheadResolution &resolution,
@@ -107,8 +107,8 @@ public:
     ProbeAgain,       ///< first stationary probe; probing once more
     Committed,        ///< probe resolved: both held frames committed
     ReachedEndAtSeam, ///< end confirmed at an ambiguous seam; F1 committed
-    Paused,           ///< cannot verify; held frames kept for an explicit choice
-    Halted,           ///< unrecoverable; capture keeps only committed frames
+    Paused, ///< cannot verify; held frames kept for an explicit choice
+    Halted, ///< unrecoverable; capture keeps only committed frames
   };
   enum class HaltReason {
     None,
@@ -133,6 +133,9 @@ public:
   };
 
   explicit AutoCapture(Axis axis);
+  /// Reserves memory retained by the owning capture job during assembly.
+  /// Set before the first frame is fed.
+  void setExternalBytes(long long bytes);
   [[nodiscard]] Outcome feed(const QImage &cropped);
   /// Commit the paused best-effort path (an unverified seam the user chose to
   /// keep); counts toward unverifiedSeams().
@@ -145,7 +148,9 @@ public:
   /// call, and
   /// a page that really had ended just concludes again.
   void resumeFromEnd();
-  [[nodiscard]] QImage finish(QString &error);
+  [[nodiscard]] QImage finish(QString &error,
+                              const std::atomic<bool> *cancel = nullptr,
+                              long long externalBytes = 0);
   [[nodiscard]] bool started() const { return accumulator_.has_value(); }
   [[nodiscard]] bool reachedEnd() const { return state_ == State::EndReached; }
   [[nodiscard]] bool halted() const { return state_ == State::Halted; }
@@ -180,6 +185,7 @@ private:
   int kept_ = 0;
   int unverifiedSeams_ = 0;
   HaltReason haltReason_ = HaltReason::None;
+  long long externalBytes_ = 0;
 };
 
 } // namespace stitch

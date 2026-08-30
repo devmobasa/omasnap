@@ -2,6 +2,7 @@
 #include "stitch.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <cmath>
 #include <cstdint>
@@ -94,6 +95,7 @@ GrayView downsampleToGray(const QImage &image, Axis axis) {
 
 
 namespace {
+std::atomic<bool> gFailNextStitchAllocation{false};
 constexpr double kInf = std::numeric_limits<double>::infinity();
 
 // Rust total_cmp order: finite ascending, NaN last. Used for sorting samples.
@@ -444,8 +446,9 @@ std::vector<std::uint8_t> copyFrameTight(const RgbaFrame &frame) {
 } // namespace
 
 StitchAccumulator::StitchAccumulator(const QImage &first, Axis axis, bool &ok,
-                                     QString &error)
-    : axis_(axis) {
+                                     QString &error,
+                                     const long long externalBytes)
+    : axis_(axis), externalBytes_(std::max(0LL, externalBytes)) {
   const RgbaFrame frame = asRgba(first);
   if (!validateFrame(frame, 0, 0, error)) {
     ok = false;
@@ -456,6 +459,18 @@ StitchAccumulator::StitchAccumulator(const QImage &first, Axis axis, bool &ok,
   axisLen_ = axis == Axis::Vertical ? height_ : width_;
   crossLen_ = axis == Axis::Vertical ? width_ : height_;
   maxEdge_ = std::min(axisLen_ / 8, kMaxStationaryEdge);
+  const long long initialBytes =
+      static_cast<long long>(crossLen_) * axisLen_ * 4;
+  const long long initialScoring =
+      static_cast<long long>(maxEdge_) * 4 * sizeof(std::uint64_t);
+  if (exceedsStitchBudget(crossLen_, axisLen_) ||
+      exceedsStitchWorkingBudget(initialBytes + externalBytes_, initialScoring,
+                                 initialBytes)) {
+    error = QStringLiteral("initial scroll frame exceeds the stitch memory "
+                           "budget");
+    ok = false;
+    return;
+  }
   firstRgba_ = copyFrameTight(frame);
   edgeSums_.assign(maxEdge_, 0);
   edgeCounts_.assign(maxEdge_, 0);
@@ -524,10 +539,18 @@ bool StitchAccumulator::pushOriented(const QImage &image, int delta,
   }
   // Refuse before mutating, so the capture so far stays intact and can still
   // be finished: the caller reports this and the user stitches what they have.
-  if (exceedsStitchBudget(crossLen_, axisLen_ + newTotal)) {
+  const long long projectedOutput = outputBytesForDelta(delta);
+  const long long projectedRetained =
+      static_cast<long long>(retainedRgbaBytes()) +
+      retainedBandBytesForDelta(delta);
+  if (exceedsStitchBudget(crossLen_, axisLen_ + newTotal) ||
+      exceedsStitchWorkingBudget(projectedRetained + externalBytes_, scoringBytes(),
+                                 projectedOutput)) {
     error = QStringLiteral("scroll capture reached its maximum length "
-                           "(%1 MB); finish to keep what was captured")
-                .arg(kMaxStitchedBytes / (1024 * 1024));
+                           "(%1 MB output / %2 MB working); finish to keep "
+                           "what was captured")
+                .arg(kMaxStitchedBytes / (1024 * 1024))
+                .arg(kMaxStitchWorkingBytes / (1024 * 1024));
     return false;
   }
 
@@ -653,8 +676,13 @@ int StitchAccumulator::nearStationaryTrailingZone(int strip) const {
 bool StitchAccumulator::wouldExceedBudget(int delta) const {
   if (!valid_ || delta <= 0)
     return false;
-  return exceedsStitchBudget(crossLen_,
-                             axisLen_ + static_cast<long long>(totalDelta_) + delta);
+  const long long output = outputBytesForDelta(delta);
+  const long long retained = static_cast<long long>(retainedRgbaBytes()) +
+                             retainedBandBytesForDelta(delta);
+  return exceedsStitchBudget(
+             crossLen_, axisLen_ + static_cast<long long>(totalDelta_) + delta) ||
+         exceedsStitchWorkingBudget(retained + externalBytes_, scoringBytes(),
+                                    output);
 }
 
 bool StitchAccumulator::exceedsWidelyOpenableEdge() const {
@@ -671,7 +699,62 @@ long StitchAccumulator::retainedRgbaBytes() const {
   return total;
 }
 
-QImage StitchAccumulator::finish(QString &error) {
+long long StitchAccumulator::retainedBandBytesForDelta(const int delta) const {
+  const long long retainedExtent =
+      std::min<long long>(axisLen_, static_cast<long long>(delta) + maxEdge_);
+  return static_cast<long long>(crossLen_) * retainedExtent * 4;
+}
+
+long long StitchAccumulator::outputBytesForDelta(const int delta) const {
+  return static_cast<long long>(crossLen_) *
+         (axisLen_ + static_cast<long long>(totalDelta_) + delta) * 4;
+}
+
+long long StitchAccumulator::scoringBytes() const {
+  return static_cast<long long>(edgeSums_.size() + edgeCounts_.size() +
+                                alignedSums_.size() + alignedCounts_.size()) *
+         static_cast<long long>(sizeof(std::uint64_t));
+}
+
+StitchAccumulator::MemoryUsage
+StitchAccumulator::memoryUsageForFinish(const long long externalBytes) const {
+  MemoryUsage usage;
+  usage.retainedRgbaBytes = retainedRgbaBytes();
+  usage.scoringBytes = scoringBytes();
+  usage.outputBytes = valid_ ? outputBytesForDelta(0) : 0;
+  usage.externalBytes = std::max(externalBytes_, std::max(0LL, externalBytes));
+  usage.peakBytes = usage.retainedRgbaBytes + usage.scoringBytes +
+                    usage.outputBytes + usage.conversionBytes +
+                    usage.externalBytes;
+  return usage;
+}
+
+void StitchAccumulator::releaseBuffers() {
+  std::vector<std::uint8_t>().swap(firstRgba_);
+  std::vector<TailBand>().swap(bands_);
+  std::vector<std::uint64_t>().swap(edgeSums_);
+  std::vector<std::uint64_t>().swap(edgeCounts_);
+  std::vector<std::uint64_t>().swap(alignedSums_);
+  std::vector<std::uint64_t>().swap(alignedCounts_);
+  valid_ = false;
+}
+
+void failNextStitchAllocationForTest() {
+  gFailNextStitchAllocation.store(true, std::memory_order_release);
+}
+
+QImage StitchAccumulator::finish(QString &error,
+                                 const std::atomic<bool> *cancel,
+                                 const long long externalBytes) {
+  const auto cancelled = [&] {
+    if (!cancel || !cancel->load(std::memory_order_acquire))
+      return false;
+    error = QStringLiteral("stitch cancelled");
+    releaseBuffers();
+    return true;
+  };
+  if (cancelled())
+    return {};
   if (!valid_) {
     error = QStringLiteral("accumulator is not initialized");
     return {};
@@ -692,83 +775,147 @@ QImage StitchAccumulator::finish(QString &error) {
     }
   }
 
+  const MemoryUsage usage = memoryUsageForFinish(externalBytes);
+  if (exceedsStitchWorkingBudget(
+          usage.retainedRgbaBytes + usage.externalBytes, usage.scoringBytes,
+          usage.outputBytes, usage.conversionBytes)) {
+    error = QStringLiteral("stitch working set exceeds its %1 MB budget")
+                .arg(kMaxStitchWorkingBytes / (1024 * 1024));
+    return {};
+  }
+  if (cancelled())
+    return {};
+
+  const int totalWidth =
+      axis_ == Axis::Vertical ? width_ : width_ + totalDelta_;
+  const int totalHeight =
+      axis_ == Axis::Vertical ? height_ + totalDelta_ : height_;
+  QImage image;
+  if (!gFailNextStitchAllocation.exchange(false, std::memory_order_acq_rel))
+    image = QImage(totalWidth, totalHeight, QImage::Format_RGBA8888);
+  if (image.isNull()) {
+    error = QStringLiteral("could not allocate the stitched image (%1x%2)")
+                .arg(totalWidth)
+                .arg(totalHeight);
+    return {};
+  }
+  if (cancelled())
+    return {};
+
+  // These vectors are only needed to decide the stationary trailing edge,
+  // which is now fixed. Drop them before touching the output pages.
+  std::vector<std::uint64_t>().swap(edgeSums_);
+  std::vector<std::uint64_t>().swap(edgeCounts_);
+  std::vector<std::uint64_t>().swap(alignedSums_);
+  std::vector<std::uint64_t>().swap(alignedCounts_);
+
   if (axis_ == Axis::Vertical) {
     const int contentBottom = height_ - trailing;
-    const int totalHeight = height_ + totalDelta_;
     const int rowBytes = width_ * 4;
-    // Rows go straight into the image. Assembling into a vector first and
-    // copying would hold the finished image twice, which is the difference
-    // between fitting and being OOM-killed on a very long capture. A reverse
-    // capture is emitted back-to-front rather than reversed afterwards.
-    QImage image(width_, totalHeight, QImage::Format_RGBA8888);
-    if (image.isNull()) {
-      error = QStringLiteral("could not allocate the stitched image (%1x%2)")
-                  .arg(width_)
-                  .arg(totalHeight);
-      return {};
-    }
     const bool reverse = direction_ == Direction::Reverse;
     int row = 0;
     const auto emitRows = [&](const std::vector<std::uint8_t> &source,
-                              std::size_t byteStart, int rows) {
+                              const std::size_t byteStart, const int rows) {
       for (int i = 0; i < rows; ++i, ++row) {
+        if (cancel && cancel->load(std::memory_order_acquire))
+          return false;
         const int destination = reverse ? totalHeight - 1 - row : row;
         std::memcpy(image.scanLine(destination),
                     source.data() + byteStart +
                         static_cast<std::size_t>(i) * rowBytes,
                     rowBytes);
       }
+      return true;
     };
-    // First frame's content rows.
-    emitRows(firstRgba_, 0, contentBottom);
-    // Each band's delta rows.
-    for (const TailBand &band : bands_) {
+    if (!emitRows(firstRgba_, 0, contentBottom)) {
+      cancelled();
+      return {};
+    }
+    std::vector<std::uint8_t>().swap(firstRgba_);
+    for (std::size_t index = 0; index < bands_.size(); ++index) {
+      TailBand &band = bands_[index];
       const int sourceStart = contentBottom - band.delta;
       const int localStart = sourceStart - band.sourceAxisStart;
-      emitRows(band.rgba, static_cast<std::size_t>(localStart) * rowBytes,
-               band.delta);
+      if (!emitRows(band.rgba,
+                    static_cast<std::size_t>(localStart) * rowBytes,
+                    band.delta)) {
+        cancelled();
+        return {};
+      }
+      if (index + 1 != bands_.size() || trailing == 0)
+        std::vector<std::uint8_t>().swap(band.rgba);
     }
-    // One trailing strip from the last band.
     if (trailing > 0) {
-      const TailBand &last = bands_.back();
+      TailBand &last = bands_.back();
       const int localStart = contentBottom - last.sourceAxisStart;
-      emitRows(last.rgba, static_cast<std::size_t>(localStart) * rowBytes,
-               trailing);
+      if (!emitRows(last.rgba,
+                    static_cast<std::size_t>(localStart) * rowBytes,
+                    trailing)) {
+        cancelled();
+        return {};
+      }
+      std::vector<std::uint8_t>().swap(last.rgba);
     }
+    // A terminal request can arrive after the last row copy. Give it one
+    // final assembly-side cancellation point before publishing the image to
+    // the coordinator.
+    if (cancelled())
+      return {};
+    releaseBuffers();
     return image;
   }
 
-  // Horizontal.
   const int contentRight = width_ - trailing;
-  const int totalWidth = width_ + totalDelta_;
-  QImage image(totalWidth, height_, QImage::Format_RGBA8888);
+  const bool reverse = direction_ == Direction::Reverse;
   for (int y = 0; y < height_; ++y) {
+    if (cancel && cancel->load(std::memory_order_acquire)) {
+      cancelled();
+      return {};
+    }
     std::uint8_t *dst = image.scanLine(y);
-    std::size_t cursor = 0;
-    const std::size_t firstRow = static_cast<std::size_t>(y) * width_ * 4;
-    std::memcpy(dst, firstRgba_.data() + firstRow, static_cast<std::size_t>(contentRight) * 4);
-    cursor += static_cast<std::size_t>(contentRight) * 4;
+    int cursor = 0;
+    const auto emitPixels = [&](const std::uint8_t *source, const int count) {
+      if (!reverse) {
+        std::memcpy(dst + static_cast<std::size_t>(cursor) * 4, source,
+                    static_cast<std::size_t>(count) * 4);
+      } else {
+        for (int pixel = 0; pixel < count; ++pixel)
+          std::memcpy(dst + static_cast<std::size_t>(
+                                totalWidth - 1 - cursor - pixel) *
+                                4,
+                      source + static_cast<std::size_t>(pixel) * 4, 4);
+      }
+      cursor += count;
+    };
+
+    const std::size_t firstRow =
+        static_cast<std::size_t>(y) * width_ * 4;
+    emitPixels(firstRgba_.data() + firstRow, contentRight);
     for (const TailBand &band : bands_) {
       const int bandWidth = width_ - band.sourceAxisStart;
       const int sourceStart = contentRight - band.delta;
       const int localStart = sourceStart - band.sourceAxisStart;
-      const std::size_t byteStart = (static_cast<std::size_t>(y) * bandWidth + localStart) * 4;
-      std::memcpy(dst + cursor, band.rgba.data() + byteStart, static_cast<std::size_t>(band.delta) * 4);
-      cursor += static_cast<std::size_t>(band.delta) * 4;
+      const std::size_t byteStart =
+          (static_cast<std::size_t>(y) * bandWidth + localStart) * 4;
+      emitPixels(band.rgba.data() + byteStart, band.delta);
     }
     if (trailing > 0) {
       const TailBand &last = bands_.back();
       const int bandWidth = width_ - last.sourceAxisStart;
       const int localStart = contentRight - last.sourceAxisStart;
-      const std::size_t byteStart = (static_cast<std::size_t>(y) * bandWidth + localStart) * 4;
-      std::memcpy(dst + cursor, last.rgba.data() + byteStart, static_cast<std::size_t>(trailing) * 4);
+      const std::size_t byteStart =
+          (static_cast<std::size_t>(y) * bandWidth + localStart) * 4;
+      emitPixels(last.rgba.data() + byteStart, trailing);
     }
   }
-  if (direction_ == Direction::Reverse)
-    image = image.flipped(Qt::Horizontal);
+  // Horizontal assembly checks at row boundaries, but cancellation can land
+  // during the final row. Do not return a completed image without one final
+  // authoritative check.
+  if (cancelled())
+    return {};
+  releaseBuffers();
   return image;
 }
-
 QImage stitchWithDeltas(const QVector<QImage> &frames, const QVector<int> &deltas,
                         Axis axis, QString &error) {
   if (frames.isEmpty()) {
@@ -1202,6 +1349,11 @@ int ManualCapture::manualSearchBound(int axisLen) {
 
 ManualCapture::ManualCapture(Axis axis) : axis_(axis) {}
 
+void ManualCapture::setExternalBytes(const long long bytes) {
+  if (!accumulator_)
+    externalBytes_ = std::max(0LL, bytes);
+}
+
 ManualCapture::Outcome ManualCapture::outcome(Event event,
                                               const MotionEstimate &estimate,
                                               QString error) const {
@@ -1231,7 +1383,7 @@ ManualCapture::Outcome ManualCapture::feed(const QImage &input) {
                          : QString());
     }
     bool ok = false;
-    accumulator_.emplace(cropped, axis_, ok, error);
+    accumulator_.emplace(cropped, axis_, ok, error, externalBytes_);
     if (!ok) {
       accumulator_.reset();
       return outcome(Event::Error, {}, error);
@@ -1307,7 +1459,7 @@ ManualCapture::Outcome ManualCapture::feed(const QImage &input) {
       // current appearance, and nothing captured is lost.
       bool ok = false;
       QString seedError;
-      accumulator_.emplace(cropped, axis_, ok, seedError);
+      accumulator_.emplace(cropped, axis_, ok, seedError, externalBytes_);
       if (!ok)
         return outcome(Event::Error, est, seedError);
       lastGray_ = gray;
@@ -1361,23 +1513,34 @@ ManualCapture::Outcome ManualCapture::recordMotion(const QImage &cropped,
   return outcome(Event::Kept, estimate);
 }
 
-QImage ManualCapture::finish(QString &error) {
+QImage ManualCapture::finish(QString &error, const std::atomic<bool> *cancel,
+                             const long long externalBytes) {
   if (!accumulator_) {
     error = QStringLiteral("no frames were captured");
     return {};
   }
   if (pending_) {
-    const PendingFrame pending = *pending_;
-    const bool pushed =
-        pending.direction == Direction::Forward
-            ? accumulator_->pushForward(pending.frame, pending.delta, error)
-            : accumulator_->pushReverse(pending.frame, pending.delta, error);
-    if (!pushed)
+    if (cancel && cancel->load(std::memory_order_acquire)) {
+      error = QStringLiteral("stitch cancelled");
+      pending_.reset();
       return {};
-    pending_.reset();
-    ++kept_;
+    }
+    {
+      PendingFrame pending = std::move(*pending_);
+      pending_.reset();
+      const bool pushed =
+          pending.direction == Direction::Forward
+              ? accumulator_->pushForward(pending.frame, pending.delta, error)
+              : accumulator_->pushReverse(pending.frame, pending.delta, error);
+      if (!pushed)
+        return {};
+      ++kept_;
+    } // Drop the pending full-resolution frame before output allocation.
   }
-  return accumulator_->finish(error);
+  lastGray_ = {};
+  previousGray_ = {};
+  havePrevious_ = false;
+  return accumulator_->finish(error, cancel, externalBytes);
 }
 
 } // namespace stitch

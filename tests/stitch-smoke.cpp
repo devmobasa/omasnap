@@ -36,6 +36,25 @@ QImage makeTexture(int width, int height) {
   }
   return image;
 }
+
+bool exactPixels(const QImage &actual, const QImage &expected,
+                 const char *fixture) {
+  if (actual.size() != expected.size()) {
+    std::fprintf(stderr, "%s size mismatch %dx%d != %dx%d\n", fixture,
+                 actual.width(), actual.height(), expected.width(),
+                 expected.height());
+    return false;
+  }
+  for (int y = 0; y < actual.height(); ++y) {
+    for (int x = 0; x < actual.width(); ++x) {
+      if (actual.pixel(x, y) != expected.pixel(x, y)) {
+        std::fprintf(stderr, "%s pixel mismatch at %d,%d\n", fixture, x, y);
+        return false;
+      }
+    }
+  }
+  return true;
+}
 } // namespace
 
 
@@ -403,7 +422,43 @@ bool runAutoCaptureChecks() {
       return false;
     QString error;
     const QImage stitched = session.finish(error);
-    if (stitched.isNull() || stitched.height() != height)
+    const QImage expected =
+        doc.copy(0, 0, 64, height).convertToFormat(QImage::Format_RGBA8888);
+    if (!exactPixels(stitched, expected, "vertical auto"))
+      return false;
+  }
+  // (a2) The same AutoCapture path must preserve every pixel horizontally.
+  {
+    const QImage verticalDoc = makeTexture(64, 500);
+    QImage doc(500, 64, QImage::Format_ARGB32);
+    for (int y = 0; y < doc.height(); ++y) {
+      auto *row = reinterpret_cast<QRgb *>(doc.scanLine(y));
+      for (int x = 0; x < doc.width(); ++x)
+        row[x] = verticalDoc.pixel(y, x);
+    }
+    const auto window = [&](int left) { return doc.copy(left, 0, 200, 64); };
+    AutoCapture session(Axis::Horizontal);
+    AutoCapture::Outcome out = session.feed(window(0));
+    if (out.event != Event::Seeded || out.ack != Ack::Normal)
+      return false;
+    int width = 200;
+    for (const int left : {60, 120, 180}) {
+      out = session.feed(window(left));
+      if (out.event != Event::Appended || out.ack != Ack::Normal)
+        return false;
+      width += 60;
+    }
+    out = session.feed(window(180));
+    if (out.event != Event::StillOnce || out.ack != Ack::Normal)
+      return false;
+    out = session.feed(window(180));
+    if (out.event != Event::ReachedEnd || !session.reachedEnd())
+      return false;
+    QString error;
+    const QImage stitched = session.finish(error);
+    const QImage expected =
+        doc.copy(0, 0, width, 64).convertToFormat(QImage::Format_RGBA8888);
+    if (!exactPixels(stitched, expected, "horizontal auto"))
       return false;
   }
   // (b) Solid first frames never seed; the ninth halts.
@@ -613,6 +668,78 @@ bool runStitchChecks() {
     if (rebuilt.convertToFormat(QImage::Format_RGBA8888) != expected)
       return false;
   }
+  // Horizontal reverse assembly writes directly into final orientation. It
+  // must match the old semantic result without allocating a flipped copy.
+  {
+    const QImage doc = makeTexture(400, 64);
+    const QImage f0 = doc.copy(200, 0, 160, 64);
+    const QImage f1 = doc.copy(160, 0, 160, 64);
+    const QImage f2 = doc.copy(120, 0, 160, 64);
+    QString error;
+    bool ok = false;
+    StitchAccumulator acc(f0, Axis::Horizontal, ok, error);
+    if (!ok || !acc.pushReverse(f1, 40, error) ||
+        !acc.pushReverse(f2, 40, error))
+      return false;
+    const QImage rebuilt = acc.finish(error);
+    const QImage expected =
+        doc.copy(120, 0, 240, 64).convertToFormat(QImage::Format_RGBA8888);
+    if (rebuilt.isNull() || rebuilt != expected)
+      return false;
+  }
+  // Allocation failure is checked before scanLine/memcpy for both axes, keeps
+  // the accumulator retryable, and a successful finish releases every source
+  // buffer. Accounting includes retained RGBA, scoring, and the reserved output
+  // while reserving no format-conversion image.
+  for (const Axis axis : {Axis::Vertical, Axis::Horizontal}) {
+    const QImage doc = makeTexture(240, 240);
+    const QImage first = axis == Axis::Vertical ? doc.copy(0, 0, 64, 160)
+                                                : doc.copy(0, 0, 160, 64);
+    const QImage second = axis == Axis::Vertical ? doc.copy(0, 40, 64, 160)
+                                                 : doc.copy(40, 0, 160, 64);
+    QString error;
+    bool ok = false;
+    StitchAccumulator acc(first, axis, ok, error);
+    if (!ok || !acc.pushForward(second, 40, error))
+      return false;
+    const StitchAccumulator::MemoryUsage usage = acc.memoryUsageForFinish();
+    if (usage.retainedRgbaBytes <= 0 || usage.scoringBytes <= 0 ||
+        usage.outputBytes != 64LL * 200 * 4 || usage.conversionBytes != 0 ||
+        usage.peakBytes != usage.retainedRgbaBytes + usage.scoringBytes +
+                               usage.outputBytes ||
+        exceedsStitchWorkingBudget(usage.retainedRgbaBytes, usage.scoringBytes,
+                                   usage.outputBytes))
+      return false;
+    const StitchAccumulator::MemoryUsage withExternal =
+        acc.memoryUsageForFinish(4096);
+    if (withExternal.externalBytes != 4096 ||
+        withExternal.peakBytes != usage.peakBytes + 4096)
+      return false;
+    const long retained = acc.retainedRgbaBytes();
+    failNextStitchAllocationForTest();
+    if (!acc.finish(error).isNull() || acc.retainedRgbaBytes() != retained ||
+        !error.contains(QStringLiteral("allocate")))
+      return false;
+    error.clear();
+    const QImage retried = acc.finish(error);
+    if (retried.isNull() || acc.retainedRgbaBytes() != 0)
+      return false;
+  }
+  // A Cancel arriving after Done cooperatively aborts assembly and consumes
+  // the retained stitch buffers instead of publishing a late result.
+  {
+    const QImage doc = makeTexture(96, 320);
+    QString error;
+    bool ok = false;
+    StitchAccumulator acc(doc.copy(0, 0, 96, 200), Axis::Vertical, ok, error);
+    if (!ok || !acc.pushForward(doc.copy(0, 80, 96, 200), 80, error))
+      return false;
+    std::atomic<bool> cancelled{true};
+    if (!acc.finish(error, &cancelled).isNull() ||
+        !error.contains(QStringLiteral("cancel"), Qt::CaseInsensitive) ||
+        acc.retainedRgbaBytes() != 0)
+      return false;
+  }
   // ---- ManualCapture: the live-loop semantics ------------------------------
   {
     using Event = ManualCapture::Event;
@@ -762,6 +889,12 @@ bool runStitchChecks() {
   if (exceedsStitchBudget(0, 1) || exceedsStitchBudget(1, 0) ||
       exceedsStitchBudget(2446, 1)) {
     std::fprintf(stderr, "stitch budget rejected an ordinary capture\n");
+    return false;
+  }
+  if (exceedsStitchWorkingBudget(400, 40, 500) ||
+      !exceedsStitchWorkingBudget(kMaxStitchedBytes, 1,
+                                  kMaxStitchedBytes)) {
+    std::fprintf(stderr, "stitch working-set accounting is not bounded\n");
     return false;
   }
   // The advisory edge sits well inside the hard budget, so a capture warns

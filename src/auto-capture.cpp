@@ -149,6 +149,11 @@ autoProbeDecision(const ForwardLookaheadResolution &resolution,
 
 AutoCapture::AutoCapture(Axis axis) : axis_(axis) {}
 
+void AutoCapture::setExternalBytes(const long long bytes) {
+  if (!accumulator_)
+    externalBytes_ = std::max(0LL, bytes);
+}
+
 AutoCapture::Outcome AutoCapture::outcome(Event event, Ack ack) const {
   Outcome result;
   result.event = event;
@@ -189,7 +194,7 @@ AutoCapture::Outcome AutoCapture::feed(const QImage &input) {
     }
     blankFirstFrames_ = 0;
     bool ok = false;
-    accumulator_.emplace(cropped, axis_, ok, error);
+    accumulator_.emplace(cropped, axis_, ok, error, externalBytes_);
     if (!ok) {
       accumulator_.reset();
       state_ = State::Halted;
@@ -402,12 +407,20 @@ void AutoCapture::resumeFromEnd() {
   state_ = State::Streaming;
 }
 
-QImage AutoCapture::finish(QString &error) {
+QImage AutoCapture::finish(QString &error, const std::atomic<bool> *cancel,
+                           const long long externalBytes) {
   if (!accumulator_) {
     error = QStringLiteral("no frames were captured");
     return {};
   }
-  return accumulator_->finish(error);
+  lookahead_.reset();
+  heldF1_ = {};
+  heldF1Gray_ = {};
+  heldF2_ = {};
+  heldF2Gray_ = {};
+  pausedBestEffort_.reset();
+  lastGray_ = {};
+  return accumulator_->finish(error, cancel, externalBytes);
 }
 
 } // namespace stitch

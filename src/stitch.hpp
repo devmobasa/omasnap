@@ -8,6 +8,7 @@
 #include <QString>
 #include <QVector>
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -21,11 +22,12 @@ inline constexpr int kDownsampleCross = 4;
 inline constexpr int kMinOverlapDen = 3;
 inline constexpr int kMinOverlapPixels = 32;
 inline constexpr int kMinMotionPixels = 3;
-/// Largest stitched image a capture may grow to, as RGBA bytes. The retained
-/// bands already hold roughly the finished image, so peak memory is about
-/// twice this. It exists because Linux overcommits: an unbounded capture is
-/// not refused at allocation time, it is OOM-killed part-way through
-/// assembly, after the user has spent a minute scrolling.
+/// Largest final RGBA image a capture may grow to, plus the total stitch-owned
+/// working-set budget. The latter is enforced against the exact retained tail
+/// bands, scoring vectors, and reserved output before allocation. It exists
+/// because Linux overcommits: an unbounded capture is not refused at allocation
+/// time, it is OOM-killed part-way through assembly, after the user has spent a
+/// minute scrolling.
 /// Longest edge that image software can be relied on to open. Many renderers
 /// address pixels with signed 16-bit coordinates, so 32767 is a common wall
 /// (Firefox refuses images past it). Nothing here breaks at this size, since
@@ -34,12 +36,25 @@ inline constexpr int kMinMotionPixels = 3;
 inline constexpr int kWidelyOpenableEdge = 32767;
 inline constexpr long long kMaxStitchedBytes = 512LL * 1024 * 1024;
 inline constexpr long long kMaxStitchedPixels = kMaxStitchedBytes / 4;
+inline constexpr long long kMaxStitchWorkingBytes = 2 * kMaxStitchedBytes;
 /// Whether growing a capture of `crossLen` by `axisExtent` along the motion
 /// axis would pass that budget.
 [[nodiscard]] constexpr bool exceedsStitchBudget(long long crossLen,
                                                  long long axisExtent) {
   return crossLen > 0 && axisExtent > 0 &&
          crossLen * axisExtent > kMaxStitchedPixels;
+}
+[[nodiscard]] constexpr bool
+exceedsStitchWorkingBudget(long long retainedBytes, long long scoringBytes,
+                           long long outputBytes,
+                           long long conversionBytes = 0) {
+  if (retainedBytes < 0 || scoringBytes < 0 || outputBytes < 0 ||
+      conversionBytes < 0)
+    return true;
+  return retainedBytes > kMaxStitchWorkingBytes - scoringBytes ||
+         retainedBytes + scoringBytes > kMaxStitchWorkingBytes - outputBytes ||
+         retainedBytes + scoringBytes + outputBytes >
+             kMaxStitchWorkingBytes - conversionBytes;
 }
 inline constexpr double kStationaryError = 1.0;
 inline constexpr double kMaxStationaryError = 8.0;
@@ -49,10 +64,10 @@ inline constexpr double kMinConfidence = 1.10;
 inline constexpr double kMinErrorMargin = 0.75;
 inline constexpr int kMaxForwardCandidates = 64;
 inline constexpr int kPathDeltaTolerance = 2;
-inline constexpr int kMaxStationaryEdge = 128;       // accumulator
+inline constexpr int kMaxStationaryEdge = 128; // accumulator
 inline constexpr double kStationaryEdgeError = 1.0;
 inline constexpr int kMaxStationaryScoringEdgeDen = 4;
-inline constexpr double kNearStationaryError = 1.0;  // accumulator
+inline constexpr double kNearStationaryError = 1.0; // accumulator
 
 enum class Axis { Vertical, Horizontal };
 
@@ -111,7 +126,8 @@ public:
 /// Like classifyMotion but caps the search at `maxSourceDelta` source pixels.
 [[nodiscard]] MotionEstimate classifyMotionBounded(const GrayView &prev,
                                                    const GrayView &cur,
-                                                   Axis axis, int maxSourceDelta);
+                                                   Axis axis,
+                                                   int maxSourceDelta);
 
 // --- Correlation core (exposed for the smoke's bit-exact scoring check) -----
 /// Mean absolute grayscale error for aligning `cur` onto `prev` at `shift`
@@ -131,9 +147,8 @@ struct StationaryEdges {
   int lead = 0;
   int trail = 0;
 };
-[[nodiscard]] StationaryEdges stationaryScoringEdges(const GrayView &prev,
-                                                     const GrayView &cur,
-                                                     Axis axis);
+[[nodiscard]] StationaryEdges
+stationaryScoringEdges(const GrayView &prev, const GrayView &cur, Axis axis);
 
 // --- Forward lookahead (auto-scroll alignment verification) -----------------
 /// One forward-only alignment candidate retained for lookahead resolution.
@@ -172,14 +187,14 @@ struct StationaryProbeFirstMatch {
 /// Result of resolving an ambiguous forward pair with one lookahead frame.
 struct ForwardLookaheadResolution {
   enum class Tag {
-    Resolved,        ///< all three comparisons agree on a distinct path
-    LowErrorPeriodic,///< accepted using the auto worker's known direction
-    StationaryProbe, ///< the probe did not move relative to the pending frame
-    Unresolved,      ///< only an explicit "continue anyway" may use bestEffort
+    Resolved,         ///< all three comparisons agree on a distinct path
+    LowErrorPeriodic, ///< accepted using the auto worker's known direction
+    StationaryProbe,  ///< the probe did not move relative to the pending frame
+    Unresolved,       ///< only an explicit "continue anyway" may use bestEffort
   };
   Tag tag = Tag::Unresolved;
-  std::optional<ForwardMatchPath> path;       // Resolved / LowErrorPeriodic /
-                                              // Unresolved best-effort
+  std::optional<ForwardMatchPath> path; // Resolved / LowErrorPeriodic /
+                                        // Unresolved best-effort
   std::optional<StationaryProbeFirstMatch> firstMatch; // StationaryProbe
 };
 /// A pending forward alignment: the ambiguous pair's frames plus its retained
@@ -200,15 +215,18 @@ public:
   [[nodiscard]] std::optional<ForwardMatchCandidate>
   uniqueCandidateAtMost(int maxSourceDelta) const;
   /// Strict three-frame resolution (no physical-motion prior).
-  [[nodiscard]] ForwardLookaheadResolution resolve(const GrayView &lookahead) const;
+  [[nodiscard]] ForwardLookaheadResolution
+  resolve(const GrayView &lookahead) const;
   /// Known-forward automatic resolution: additionally accepts matcher-grade
   /// periodic paths using the worker's known direction (cadence only breaks
   /// ties).
-  [[nodiscard]] ForwardLookaheadResolution resolveAuto(const GrayView &lookahead) const;
+  [[nodiscard]] ForwardLookaheadResolution
+  resolveAuto(const GrayView &lookahead) const;
 
 private:
   [[nodiscard]] ForwardLookaheadResolution
-  resolveWithPhysicalPrior(const GrayView &lookahead, bool allowPhysicalPrior) const;
+  resolveWithPhysicalPrior(const GrayView &lookahead,
+                           bool allowPhysicalPrior) const;
 
   GrayView origin_;
   GrayView pending_;
@@ -233,11 +251,9 @@ forwardCandidateSet(const GrayView &prev, const GrayView &cur, Axis axis);
                                                         Axis axis);
 /// Resolve three candidate sets into a path (exposed for the smoke's
 /// literal-set checks).
-[[nodiscard]] ForwardLookaheadResolution
-resolveForwardCandidateSets(const ForwardCandidateSet &first,
-                            const ForwardCandidateSet &second,
-                            const ForwardCandidateSet &cumulative,
-                            bool allowPhysicalPrior);
+[[nodiscard]] ForwardLookaheadResolution resolveForwardCandidateSets(
+    const ForwardCandidateSet &first, const ForwardCandidateSet &second,
+    const ForwardCandidateSet &cumulative, bool allowPhysicalPrior);
 
 // --- Accumulator (pixel assembly) ------------------------------------------
 /// Assembles overlapping forward frames into one tall/wide image. A trailing
@@ -246,19 +262,34 @@ resolveForwardCandidateSets(const ForwardCandidateSet &first,
 /// copied once from the final frame. Frames must be RGBA (Format_RGBA8888).
 class StitchAccumulator {
 public:
+  struct MemoryUsage {
+    long long retainedRgbaBytes = 0;
+    long long scoringBytes = 0;
+    long long outputBytes = 0;
+    long long conversionBytes = 0;
+    long long externalBytes = 0;
+    long long peakBytes = 0;
+  };
   /// Begins a capture from its first frame. `ok` is set false and `error`
   /// filled on an invalid frame.
-  StitchAccumulator(const QImage &first, Axis axis, bool &ok, QString &error);
+  StitchAccumulator(const QImage &first, Axis axis, bool &ok, QString &error,
+                    long long externalBytes = 0);
   /// Retains one validated forward frame; `delta` is source pixels along the
   /// axis. Returns false with `error` set on failure (state unchanged).
-  [[nodiscard]] bool pushForward(const QImage &frame, int delta, QString &error);
+  [[nodiscard]] bool pushForward(const QImage &frame, int delta,
+                                 QString &error);
   /// Retain one reverse (scrolled-up/left) frame while keeping the final image
   /// in document order. Cannot be mixed with pushForward.
-  [[nodiscard]] bool pushReverse(const QImage &frame, int delta, QString &error);
+  [[nodiscard]] bool pushReverse(const QImage &frame, int delta,
+                                 QString &error);
   /// Assembles the final image; returns a null QImage with `error` set on
   /// failure. Consumes the accumulator's buffers.
-  [[nodiscard]] QImage finish(QString &error);
-  [[nodiscard]] int frameCount() const { return static_cast<int>(bands_.size()) + 1; }
+  [[nodiscard]] QImage finish(QString &error,
+                              const std::atomic<bool> *cancel = nullptr,
+                              long long externalBytes = 0);
+  [[nodiscard]] int frameCount() const {
+    return static_cast<int>(bands_.size()) + 1;
+  }
   /// Whether growing by `delta` along the motion axis would pass the budget.
   [[nodiscard]] bool wouldExceedBudget(int delta) const;
   /// Whether the finished image would be longer than most other software will
@@ -266,6 +297,8 @@ public:
   [[nodiscard]] bool exceedsWidelyOpenableEdge() const;
   // Test accessors.
   [[nodiscard]] long retainedRgbaBytes() const;
+  [[nodiscard]] MemoryUsage
+  memoryUsageForFinish(long long externalBytes = 0) const;
   [[nodiscard]] int stationaryTrailingStripForTest() const {
     return stationaryTrailingStrip();
   }
@@ -281,7 +314,12 @@ private:
   };
   [[nodiscard]] int stationaryTrailingStrip() const;
   [[nodiscard]] int nearStationaryTrailingZone(int strip) const;
-  [[nodiscard]] bool pushOriented(const QImage &frame, int delta, QString &error);
+  [[nodiscard]] bool pushOriented(const QImage &frame, int delta,
+                                  QString &error);
+  [[nodiscard]] long long retainedBandBytesForDelta(int delta) const;
+  [[nodiscard]] long long outputBytesForDelta(int delta) const;
+  [[nodiscard]] long long scoringBytes() const;
+  void releaseBuffers();
 
   enum class Direction { None, Forward, Reverse };
   Direction direction_ = Direction::None;
@@ -292,10 +330,17 @@ private:
   std::vector<std::uint8_t> firstRgba_;
   std::vector<TailBand> bands_;
   int totalDelta_ = 0;
-  std::vector<std::uint64_t> edgeSums_, edgeCounts_, alignedSums_, alignedCounts_;
+  std::vector<std::uint64_t> edgeSums_, edgeCounts_, alignedSums_,
+      alignedCounts_;
+  long long externalBytes_ = 0;
 };
 
-// --- Live manual capture session ------------------------------------------------
+/// Makes the next final-image allocation return null. Deterministic smoke-only
+/// failure injection; production never calls it.
+void failNextStitchAllocationForTest();
+
+// --- Live manual capture session
+// ------------------------------------------------
 /// The decision loop of a manual scroll capture, independent of any window or
 /// compositor: feed it the cropped region from each grab and it classifies the
 /// motion against the last committed frame and grows the stitch. In manual
@@ -309,15 +354,16 @@ private:
 class ManualCapture {
 public:
   enum class Event {
-    Blank,          ///< solid-color first frame; not seeded (copy raced the overlay)
-    Seeded,         ///< first frame accepted
-    Kept,           ///< a band was committed
-    Pending,        ///< small movement held as the pending frame
-    Still,          ///< no movement
+    Blank,   ///< solid-color first frame; not seeded (copy raced the overlay)
+    Seeded,  ///< first frame accepted
+    Kept,    ///< a band was committed
+    Pending, ///< small movement held as the pending frame
+    Still,   ///< no movement
     PendingDropped, ///< a pending movement was reversed
-    ReSeeded,       ///< first frame replaced (content changed in place, nothing committed)
+    ReSeeded,       ///< first frame replaced (content changed in place, nothing
+                    ///< committed)
     Ambiguous,      ///< repeated content; keep scrolling
-    Unmatchable,    ///< no reliable overlap with the reference; keep it and warn
+    Unmatchable, ///< no reliable overlap with the reference; keep it and warn
     WrongDirection, ///< motion against the locked direction after a band exists
     Error,          ///< accumulator refused the frame (see `error`)
     Full,           ///< the capture reached its size budget; finish it
@@ -330,11 +376,16 @@ public:
     QString error;
   };
   explicit ManualCapture(Axis axis);
+  /// Reserves memory retained by the owning capture job during assembly.
+  /// Set before the first frame is fed.
+  void setExternalBytes(long long bytes);
   /// Consume one cropped grab (RGBA8888 or convertible).
   [[nodiscard]] Outcome feed(const QImage &cropped);
   /// Commit any pending frame and assemble the result (null + `error` on
   /// failure; the session stays usable).
-  [[nodiscard]] QImage finish(QString &error);
+  [[nodiscard]] QImage finish(QString &error,
+                              const std::atomic<bool> *cancel = nullptr,
+                              long long externalBytes = 0);
   [[nodiscard]] bool started() const { return accumulator_.has_value(); }
   [[nodiscard]] int keptFrames() const { return kept_; }
   /// Whether the capture is already longer than most other software will
@@ -371,6 +422,7 @@ private:
   Direction direction_ = Direction::None;
   int blankFirstFrames_ = 0;
   int kept_ = 0;
+  long long externalBytes_ = 0;
 };
 
 /// Stitch already-validated forward frames using the measured per-pair delta

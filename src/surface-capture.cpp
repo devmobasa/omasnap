@@ -11,6 +11,7 @@
 #include <wayland-client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -21,8 +22,16 @@
 #include <poll.h>
 #include <string>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
+
+namespace {
+std::atomic<int> gOutputOpenTestWidth{0};
+std::atomic<int> gOutputOpenTestHeight{0};
+std::atomic<int> gOutputOpenTestDelayMs{0};
+std::atomic<bool> gOutputOpenTestEnabled{false};
+} // namespace
 
 // Named (not anonymous) so OutputCapture::State can derive from it without
 // giving an exported type internal-linkage members.
@@ -586,6 +595,23 @@ OutputCapture::~OutputCapture() = default;
 
 bool OutputCapture::open(const QString &outputName, QString &error) {
   close();
+  if (gOutputOpenTestEnabled.load(std::memory_order_acquire)) {
+    const int delayMs = gOutputOpenTestDelayMs.load(std::memory_order_relaxed);
+    if (delayMs > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    const int width = gOutputOpenTestWidth.load(std::memory_order_relaxed);
+    const int height = gOutputOpenTestHeight.load(std::memory_order_relaxed);
+    if (width <= 0 || height <= 0) {
+      error = QStringLiteral("Invalid output-capture test dimensions");
+      return false;
+    }
+    auto state = std::make_unique<State>();
+    state->bufferWidth = static_cast<uint32_t>(width);
+    state->bufferHeight = static_cast<uint32_t>(height);
+    state->memorySize = static_cast<std::size_t>(width) * height * 4;
+    state_ = std::move(state);
+    return true;
+  }
   auto state = std::make_unique<State>();
   if (!connectOutputCaptureDisplay(*state, error))
     return false;
@@ -674,4 +700,23 @@ QSize OutputCapture::bufferSize() const {
           static_cast<int>(state_->bufferHeight)};
 }
 
+long long OutputCapture::mappedBytes() const {
+  if (!state_)
+    return 0;
+  return static_cast<long long>(state_->memorySize);
+}
+
 void OutputCapture::close() { state_.reset(); }
+
+void OutputCapture::setOpenTestDoubleForTest(const QSize &size,
+                                             const int delayMs) {
+  gOutputOpenTestWidth.store(size.width(), std::memory_order_relaxed);
+  gOutputOpenTestHeight.store(size.height(), std::memory_order_relaxed);
+  gOutputOpenTestDelayMs.store(std::max(0, delayMs),
+                              std::memory_order_relaxed);
+  gOutputOpenTestEnabled.store(true, std::memory_order_release);
+}
+
+void OutputCapture::clearOpenTestDoubleForTest() {
+  gOutputOpenTestEnabled.store(false, std::memory_order_release);
+}

@@ -15,9 +15,10 @@
 #include "auto-capture.hpp"
 #include "capture.hpp"
 #include "overlay-chrome.hpp"
+#include "scroll-capture-job.hpp"
 #include "stitch.hpp"
 
-#include <QFuture>
+#include <QFutureWatcher>
 #include <QImage>
 #include <QRect>
 #include <QPair>
@@ -25,6 +26,7 @@
 #include <QSize>
 #include <QString>
 #include <QStringList>
+#include <QTimer>
 #include <QVector>
 #include <QWidget>
 
@@ -99,6 +101,30 @@ public:
   /// been drawn. The editor reads it when another tab is picked, so the
   /// rectangle carries across instead of having to be drawn again.
   [[nodiscard]] QRect region() const { return region_; }
+  void startDelayedCaptureForTest(
+      int setupDelayMs, int finishDelayMs, const QImage &result,
+      const std::shared_ptr<std::atomic<int>> &sideEffects,
+      int cancelDrainDelayMs = 0);
+  /// Runs the real capture coordinator with component-level setup test doubles.
+  void startCaptureJobForTest(const ScrollCaptureJobSpec &spec);
+  void finishCaptureForTest() { finishCapture(); }
+  [[nodiscard]] bool capturingForTest() const {
+    return phase_ == Phase::Capturing;
+  }
+  [[nodiscard]] bool selectedForTest() const { return phase_ == Phase::Selected; }
+  [[nodiscard]] bool workerRunningForTest() const {
+    return workerWatcher_.isRunning();
+  }
+  [[nodiscard]] QString statusForTest() const { return status_; }
+  [[nodiscard]] QPoint cancelButtonCenterForTest() const {
+    return (phase_ == Phase::Selected || phase_ == Phase::Preparing
+                ? selectedCancelButtonRect()
+                : cancelButtonRect())
+        .center();
+  }
+  [[nodiscard]] QPoint doneButtonCenterForTest() const {
+    return doneButtonRect().center();
+  }
 
 signals:
   /// The capture is done: `image` is the stitched result.
@@ -119,7 +145,7 @@ protected:
   void keyPressEvent(QKeyEvent *event) override;
 
 private:
-  enum class Phase { Selected, Capturing, Finishing, Finished };
+  enum class Phase { Selected, Preparing, Capturing, Finishing, Finished };
   enum class Mode { Manual, Auto };
   /// What a press on the region's chrome does: the eight edges and corners
   /// resize it, the puck in the middle moves it. The middle is otherwise the
@@ -136,12 +162,11 @@ private:
     Left,
     Move
   };
-  /// Everything the worker thread owns; the UI thread only reads it after
-  /// the worker has stopped.
-  struct Worker;
-
   void startCapture(Mode mode, stitch::Axis axis);
-  void stopWorker();
+  void launchCaptureJob(const ScrollCaptureJobSpec &spec);
+  void requestWorker(ScrollCaptureJobCommand command);
+  void pollWorker();
+  void workerFinished();
   void finishCapture();
   void cancel();
   /// Region chosen (dragged or restored): remember it, expose the page, hand
@@ -194,13 +219,6 @@ private:
   /// Mode buttons shown in the Selected phase; index into kModeButtons.
   [[nodiscard]] QRect modeButtonRect(int index) const;
   [[nodiscard]] int modeButtonAt(const QPoint &point) const;
-  // Worker-thread bodies.
-  void captureLoop();     // manual: poll and classify
-  void autoCaptureLoop(); // automatic: consume ready cycles and acknowledge
-  void postStatus(const QString &status, bool warning = false);
-  /// Worker-thread notice that an auto capture stopped short of the end.
-  void postStalled();
-
   MonitorInfo monitor_;
   LayerShellQt::Window *layer_ = nullptr;
   Phase phase_ = Phase::Selected;
@@ -211,9 +229,9 @@ private:
   stitch::Axis axis_ = stitch::Axis::Vertical;
   QString status_;
   bool statusWarning_ = false;
-  /// Set when an auto capture stops before the end of the page, the pointer
-  /// left the frame, or the injector gave up. What has been captured is still
-  /// in the session, so it can be picked up again.
+  /// Set only when the auto session is recoverable (end detection or a dropped
+  /// ambiguous tail). Unrecoverable capture/backend failures offer Done and
+  /// Cancel, never a Continue that cannot change the state.
   bool autoStalled_ = false;
   void reserveChromeStrip();
   bool released_ = false;
@@ -228,11 +246,9 @@ private:
   /// while the pointer is on our chrome, never over the live page.
   bool keyboardGrabbed_ = true;
 
-  std::unique_ptr<Worker> worker_;
-  QFuture<void> workerFuture_;
-  std::atomic<bool> stopRequested_{false};
-  /// Auto mode: the injection worker's shared stop flag (it also sets this
-  /// itself on any exit) and the capture handshake.
-  std::shared_ptr<std::atomic<bool>> injectorStop_;
-  std::shared_ptr<stitch::CaptureHandshake> handshake_;
+  std::shared_ptr<ScrollCaptureJobControl> workerControl_;
+  QFutureWatcher<ScrollCaptureJobResult> workerWatcher_;
+  QTimer workerPollTimer_;
+  std::uint64_t workerRevision_ = 0;
+  std::optional<Mode> pendingMode_;
 };
