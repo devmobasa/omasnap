@@ -3089,10 +3089,14 @@ bool runRevealSavedScreenshotSmoke(QApplication &application, QString &error) {
   }
   const QByteArray revealScript = QByteArrayLiteral(
       "#!/bin/sh\n"
-      "printf '%s\\n' \"$@\" > \"$OMASNAP_TEST_REVEAL_LOG\"\n");
+      "tmp=\"${OMASNAP_TEST_REVEAL_LOG}.tmp.$$\"\n"
+      "printf '%s\\n' \"$@\" > \"$tmp\"\n"
+      "mv \"$tmp\" \"$OMASNAP_TEST_REVEAL_LOG\"\n");
   const QByteArray notificationScript = QByteArrayLiteral(
       "#!/bin/sh\n"
-      "printf '%s\\n' \"$@\" > \"$OMASNAP_TEST_NOTIFICATION_LOG\"\n");
+      "tmp=\"${OMASNAP_TEST_NOTIFICATION_LOG}.tmp.$$\"\n"
+      "printf '%s\\n' \"$@\" > \"$tmp\"\n"
+      "mv \"$tmp\" \"$OMASNAP_TEST_NOTIFICATION_LOG\"\n");
   const QByteArray copyScript =
       QByteArrayLiteral("#!/bin/sh\ncat > \"$OMASNAP_TEST_CLIPBOARD_PNG\"\n");
   const QByteArray pasteScript =
